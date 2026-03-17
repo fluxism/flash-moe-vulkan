@@ -22,7 +22,7 @@
 #define NEWLINE_TOKEN   198     // \n
 
 // Maximum conversation length in tokens
-#define MAX_CONV_TOKENS 131072  // 128K context — matches MAX_SEQ_LEN, ~1.9GB KV cache at max
+#define MAX_CONV_TOKENS 1048576  // 1M context — 397B full model, KV grows on demand
 // Maximum input line length
 #define MAX_INPUT_LINE  4096
 // Maximum tokens per response

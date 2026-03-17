@@ -110,7 +110,7 @@
 #define DOWN_B_OFF_2  3801088
 
 // KV cache maximum context length
-#define MAX_SEQ_LEN 131072   // 128K context — CPU KV caches grow via realloc if needed
+#define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
 #define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
 
 // EOS token
