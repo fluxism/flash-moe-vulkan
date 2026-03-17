@@ -2318,6 +2318,168 @@ static int parallel_pread_experts(
 }
 
 // ============================================================================
+// Per-layer weight pointer cache — built once, eliminates 40+ snprintf+lookup
+// per layer per token. With 60 layers and 15 tokens = 36,000 lookups saved.
+// ============================================================================
+
+typedef struct {
+    // Input/post-attention layer norms
+    uint16_t *input_norm_w;
+    uint16_t *post_attn_norm_w;
+
+    // Full attention weights (non-NULL only for full attention layers)
+    uint32_t *q_w; uint16_t *q_s, *q_b;
+    uint32_t *k_w; uint16_t *k_s, *k_b;
+    uint32_t *v_w; uint16_t *v_s, *v_b;
+    uint32_t *o_w; uint16_t *o_s, *o_b;
+    uint16_t *q_norm_w, *k_norm_w;
+
+    // Linear attention weights (non-NULL only for linear attention layers)
+    uint32_t *qkv_w; uint16_t *qkv_s, *qkv_b;
+    uint32_t *z_w;   uint16_t *z_s, *z_b;
+    uint32_t *b_w;   uint16_t *b_s, *b_b;
+    uint32_t *a_w;   uint16_t *a_s, *a_b;
+    uint16_t *conv1d_w;
+    float *A_log;
+    uint16_t *dt_bias;
+    uint16_t *gated_norm_w;
+    uint32_t *out_proj_w; uint16_t *out_proj_s, *out_proj_b;
+
+    // MoE routing + shared expert weights
+    uint32_t *gate_w; uint16_t *gate_s, *gate_b;
+    uint32_t *sg_w;   uint16_t *sg_s, *sg_b;   // shared gate_proj
+    uint32_t *su_w;   uint16_t *su_s, *su_b;   // shared up_proj
+    uint32_t *sd_w;   uint16_t *sd_s, *sd_b;   // shared down_proj
+    uint32_t *seg_w;  uint16_t *seg_s, *seg_b; // shared_expert_gate
+} LayerWeightCache;
+
+static LayerWeightCache layer_cache[NUM_LAYERS];
+static int layer_cache_built = 0;
+
+static void build_layer_cache(WeightFile *wf) {
+    if (layer_cache_built) return;
+    char name[256];
+
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        LayerWeightCache *lc = &layer_cache[i];
+        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+
+        // Norms
+        snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", i);
+        lc->input_norm_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", i);
+        lc->post_attn_norm_w = get_tensor_ptr(wf, name);
+
+        if (is_full) {
+            // Full attention
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", i);
+            lc->q_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", i);
+            lc->q_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", i);
+            lc->q_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", i);
+            lc->k_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.scales", i);
+            lc->k_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", i);
+            lc->k_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", i);
+            lc->v_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.scales", i);
+            lc->v_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", i);
+            lc->v_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", i);
+            lc->o_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", i);
+            lc->o_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", i);
+            lc->o_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", i);
+            lc->q_norm_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", i);
+            lc->k_norm_w = get_tensor_ptr(wf, name);
+        } else {
+            // Linear attention
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", i);
+            lc->qkv_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.scales", i);
+            lc->qkv_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.biases", i);
+            lc->qkv_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", i);
+            lc->z_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.scales", i);
+            lc->z_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.biases", i);
+            lc->z_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", i);
+            lc->b_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.scales", i);
+            lc->b_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.biases", i);
+            lc->b_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", i);
+            lc->a_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.scales", i);
+            lc->a_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.biases", i);
+            lc->a_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", i);
+            lc->conv1d_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", i);
+            lc->A_log = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", i);
+            lc->dt_bias = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", i);
+            lc->gated_norm_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", i);
+            lc->out_proj_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.scales", i);
+            lc->out_proj_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", i);
+            lc->out_proj_b = get_tensor_ptr(wf, name);
+        }
+
+        // MoE weights (same for all layers)
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", i);
+        lc->gate_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", i);
+        lc->gate_s = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", i);
+        lc->gate_b = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
+        lc->sg_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
+        lc->sg_s = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
+        lc->sg_b = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
+        lc->su_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
+        lc->su_s = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
+        lc->su_b = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
+        lc->sd_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
+        lc->sd_s = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
+        lc->sd_b = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
+        lc->seg_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", i);
+        lc->seg_s = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", i);
+        lc->seg_b = get_tensor_ptr(wf, name);
+    }
+
+    layer_cache_built = 1;
+    printf("[cache] Pre-computed weight pointers for %d layers\n", NUM_LAYERS);
+}
+
+// ============================================================================
 // Fused layer forward: GPU/CPU overlap + parallel I/O pipeline
 //
 // Pipeline per layer (2 cmd buffers, I/O overlapped with GPU):
@@ -2392,8 +2554,9 @@ static void fused_layer_forward(
     int packed_fd            // fd for packed expert file
 ) {
     init_layer_scratch();
+    if (!layer_cache_built) build_layer_cache(wf);
+    LayerWeightCache *lc = &layer_cache[layer_idx];
     int is_full = (kv != NULL);
-    char name[256];
 
     // =====================================================================
     // PHASE 1: Build & submit CMD1 (attention projections, non-blocking)
@@ -2404,9 +2567,7 @@ static void fused_layer_forward(
     cpu_vec_copy(residual, hidden, HIDDEN_DIM);
 
     // ---- Input LayerNorm (CPU — fast, ~0.01ms) ----
-    snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
-    uint16_t *norm_w = get_tensor_ptr(wf, name);
-    cpu_rms_norm(hidden, norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+    cpu_rms_norm(hidden, lc->input_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
 
     // ---- Prepare attention projection specs ----
     int num_attn_specs = 0;
@@ -2424,31 +2585,11 @@ static void fused_layer_forward(
         k_out = calloc(kv_dim, sizeof(float));
         v_out = calloc(kv_dim, sizeof(float));
 
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer_idx);
-        uint32_t *qw = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", layer_idx);
-        uint16_t *qs = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", layer_idx);
-        uint16_t *qb = get_tensor_ptr(wf, name);
-
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer_idx);
-        uint32_t *kw = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.scales", layer_idx);
-        uint16_t *ks = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", layer_idx);
-        uint16_t *kb = get_tensor_ptr(wf, name);
-
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer_idx);
-        uint32_t *vw = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.scales", layer_idx);
-        uint16_t *vs = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", layer_idx);
-        uint16_t *vb = get_tensor_ptr(wf, name);
-
-        if (qw && qs && qb && kw && ks && kb && vw && vs && vb) {
-            attn_specs[0] = (BatchMatvecSpec){ qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 };
-            attn_specs[1] = (BatchMatvecSpec){ kw, ks, kb, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 };
-            attn_specs[2] = (BatchMatvecSpec){ vw, vs, vb, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 };
+        if (lc->q_w && lc->q_s && lc->q_b && lc->k_w && lc->k_s && lc->k_b &&
+            lc->v_w && lc->v_s && lc->v_b) {
+            attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 };
+            attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 };
+            attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 };
             num_attn_specs = 3;
         }
     } else {
@@ -2460,40 +2601,12 @@ static void fused_layer_forward(
         beta_out = calloc(LINEAR_NUM_V_HEADS, sizeof(float));
         alpha_out = calloc(LINEAR_NUM_V_HEADS, sizeof(float));
 
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", layer_idx);
-        uint32_t *qkv_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.scales", layer_idx);
-        uint16_t *qkv_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.biases", layer_idx);
-        uint16_t *qkv_b = get_tensor_ptr(wf, name);
-
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", layer_idx);
-        uint32_t *z_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.scales", layer_idx);
-        uint16_t *z_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.biases", layer_idx);
-        uint16_t *z_b = get_tensor_ptr(wf, name);
-
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", layer_idx);
-        uint32_t *b_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.scales", layer_idx);
-        uint16_t *b_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.biases", layer_idx);
-        uint16_t *b_b = get_tensor_ptr(wf, name);
-
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", layer_idx);
-        uint32_t *a_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.scales", layer_idx);
-        uint16_t *a_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.biases", layer_idx);
-        uint16_t *a_b = get_tensor_ptr(wf, name);
-
-        if (qkv_w && qkv_s && qkv_b && z_w && z_s && z_b &&
-            b_w && b_s && b_b && a_w && a_s && a_b) {
-            attn_specs[0] = (BatchMatvecSpec){ qkv_w, qkv_s, qkv_b, qkv_out,   (uint32_t)qkv_dim,            HIDDEN_DIM, GROUP_SIZE, 0 };
-            attn_specs[1] = (BatchMatvecSpec){ z_w,   z_s,   z_b,   z_out,      (uint32_t)z_dim,              HIDDEN_DIM, GROUP_SIZE, 1 };
-            attn_specs[2] = (BatchMatvecSpec){ b_w,   b_s,   b_b,   beta_out,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2 };
-            attn_specs[3] = (BatchMatvecSpec){ a_w,   a_s,   a_b,   alpha_out,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3 };
+        if (lc->qkv_w && lc->qkv_s && lc->qkv_b && lc->z_w && lc->z_s && lc->z_b &&
+            lc->b_w && lc->b_s && lc->b_b && lc->a_w && lc->a_s && lc->a_b) {
+            attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out,   (uint32_t)qkv_dim,            HIDDEN_DIM, GROUP_SIZE, 0 };
+            attn_specs[1] = (BatchMatvecSpec){ lc->z_w,   lc->z_s,   lc->z_b,   z_out,      (uint32_t)z_dim,              HIDDEN_DIM, GROUP_SIZE, 1 };
+            attn_specs[2] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2 };
+            attn_specs[3] = (BatchMatvecSpec){ lc->a_w,   lc->a_s,   lc->a_b,   alpha_out,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3 };
             num_attn_specs = 4;
         }
     }
@@ -2537,59 +2650,19 @@ static void fused_layer_forward(
     int oproj_in_dim = 0;
 
     if (is_full) {
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
-        oproj_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", layer_idx);
-        oproj_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", layer_idx);
-        oproj_b = get_tensor_ptr(wf, name);
-        oproj_in_dim = NUM_ATTN_HEADS * HEAD_DIM;  // 8192
+        oproj_w = lc->o_w; oproj_s = lc->o_s; oproj_b = lc->o_b;
+        oproj_in_dim = NUM_ATTN_HEADS * HEAD_DIM;
     } else if (!linear_attn_bypass) {
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", layer_idx);
-        oproj_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.scales", layer_idx);
-        oproj_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", layer_idx);
-        oproj_b = get_tensor_ptr(wf, name);
-        oproj_in_dim = LINEAR_TOTAL_VALUE;  // 8192
+        oproj_w = lc->out_proj_w; oproj_s = lc->out_proj_s; oproj_b = lc->out_proj_b;
+        oproj_in_dim = LINEAR_TOTAL_VALUE;
     }
 
-    // Pre-lookup MoE weight pointers (routing gate + shared expert)
-    // Done here to avoid snprintf overhead in the hot path.
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", layer_idx);
-    uint32_t *gate_w = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", layer_idx);
-    uint16_t *gate_s = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", layer_idx);
-    uint16_t *gate_b = get_tensor_ptr(wf, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
-    uint32_t *sgw = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", layer_idx);
-    uint16_t *sgs = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", layer_idx);
-    uint16_t *sgb = get_tensor_ptr(wf, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", layer_idx);
-    uint32_t *suw = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", layer_idx);
-    uint16_t *sus = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", layer_idx);
-    uint16_t *sub = get_tensor_ptr(wf, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", layer_idx);
-    uint32_t *seg_w = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", layer_idx);
-    uint16_t *seg_s = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", layer_idx);
-    uint16_t *seg_b = get_tensor_ptr(wf, name);
-
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", layer_idx);
-    uint32_t *sdw = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", layer_idx);
-    uint16_t *sds = get_tensor_ptr(wf, name);
-    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", layer_idx);
-    uint16_t *sdb = get_tensor_ptr(wf, name);
+    // All MoE weight pointers from cache (zero snprintf overhead)
+    uint32_t *gate_w = lc->gate_w; uint16_t *gate_s = lc->gate_s, *gate_b = lc->gate_b;
+    uint32_t *sgw = lc->sg_w;     uint16_t *sgs = lc->sg_s,       *sgb = lc->sg_b;
+    uint32_t *suw = lc->su_w;     uint16_t *sus = lc->su_s,       *sub = lc->su_b;
+    uint32_t *seg_w = lc->seg_w;  uint16_t *seg_s = lc->seg_s,   *seg_b = lc->seg_b;
+    uint32_t *sdw = lc->sd_w;     uint16_t *sds = lc->sd_s,       *sdb = lc->sd_b;
 
     // ---- CPU attention compute (produces attn_out for o_proj) ----
     float *attn_out_for_oproj = NULL;
@@ -2610,10 +2683,8 @@ static void fused_layer_forward(
         }
 
         // Q/K RMSNorm
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", layer_idx);
-        uint16_t *qnorm_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", layer_idx);
-        uint16_t *knorm_w = get_tensor_ptr(wf, name);
+        uint16_t *qnorm_w = lc->q_norm_w;
+        uint16_t *knorm_w = lc->k_norm_w;
         if (qnorm_w) {
             for (int h = 0; h < NUM_ATTN_HEADS; h++) {
                 float *qh = q + h * HEAD_DIM;
@@ -2684,8 +2755,7 @@ static void fused_layer_forward(
             int qkv_dim = LINEAR_CONV_DIM;
 
             // Conv1d step
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", layer_idx);
-            uint16_t *conv_w = get_tensor_ptr(wf, name);
+            uint16_t *conv_w = lc->conv1d_w;
             float *conv_out = s_conv_out;
             memset(conv_out, 0, qkv_dim * sizeof(float));
             if (conv_w) {
@@ -2718,10 +2788,8 @@ static void fused_layer_forward(
             }
 
             // Gated delta net recurrence
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", layer_idx);
-            float *A_log = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", layer_idx);
-            uint16_t *dt_bias_bf16 = get_tensor_ptr(wf, name);
+            float *A_log = lc->A_log;
+            uint16_t *dt_bias_bf16 = lc->dt_bias;
 
             float *out_values = s_out_vals;
             memset(out_values, 0, LINEAR_TOTAL_VALUE * sizeof(float));
@@ -2774,8 +2842,7 @@ static void fused_layer_forward(
             }
 
             // RMSNormGated
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", layer_idx);
-            uint16_t *gated_norm_w = get_tensor_ptr(wf, name);
+            uint16_t *gated_norm_w = lc->gated_norm_w;
             float *gated_out = s_gated_out;
             memset(gated_out, 0, LINEAR_TOTAL_VALUE * sizeof(float));
             for (int vh = 0; vh < LINEAR_NUM_V_HEADS; vh++) {
@@ -2887,9 +2954,7 @@ static void fused_layer_forward(
         cpu_vec_copy(h_mid, hidden, HIDDEN_DIM);
 
         // Post-attention norm -> h_post
-        snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer_idx);
-        uint16_t *post_norm_w = get_tensor_ptr(wf, name);
-        cpu_rms_norm(hidden, post_norm_w, h_post, HIDDEN_DIM, RMS_NORM_EPS);
+        cpu_rms_norm(hidden, lc->post_attn_norm_w, h_post, HIDDEN_DIM, RMS_NORM_EPS);
 
         // CMD2b: routing + shared expert (4 dispatches, 1 commit)
         BatchMatvecSpec moe_specs[4] = {
@@ -2928,9 +2993,7 @@ static void fused_layer_forward(
         cpu_vec_copy(h_mid, hidden, HIDDEN_DIM);
 
         // Post-attention norm
-        snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer_idx);
-        uint16_t *post_norm_w = get_tensor_ptr(wf, name);
-        cpu_rms_norm(hidden, post_norm_w, h_post, HIDDEN_DIM, RMS_NORM_EPS);
+        cpu_rms_norm(hidden, lc->post_attn_norm_w, h_post, HIDDEN_DIM, RMS_NORM_EPS);
 
         // Routing + shared expert batch
         if (have_moe_weights) {
