@@ -44,21 +44,21 @@
 \@writefile{toc}{\contentsline {paragraph}{DMA-aligned read buffers.}{4}{section*.15}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {4}Experimental Results}{4}{section.4}\protected@file@percent }
 \newlabel{sec:results}{{4}{4}{Experimental Results}{section.4}{}}
-\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Per-layer time breakdown for 2-bit + F\_NOCACHE configuration. Total: 3.14\,ms/layer $\times $ 60 layers = 188\,ms/token $\approx $ 5.3\,tok/s. Expert I/O from NVMe is the dominant cost.}}{4}{figure.caption.17}\protected@file@percent }
-\newlabel{fig:breakdown}{{1}{4}{Per-layer time breakdown for 2-bit + F\_NOCACHE configuration. Total: 3.14\,ms/layer $\times $ 60 layers = 188\,ms/token $\approx $ 5.3\,tok/s. Expert I/O from NVMe is the dominant cost}{figure.caption.17}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Performance Progression}{4}{subsection.4.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Per-Layer Breakdown}{4}{subsection.4.2}\protected@file@percent }
 \@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Performance of Qwen3.5-397B-A17B inference configurations on M3 Max (48\,GB). Expert bits: quantization precision. Cache: application-level LRU size. tok/s measured as average over 50+ tokens after warmup. Quality assessed by output coherence across math, code, and reasoning prompts.}}{5}{table.caption.16}\protected@file@percent }
 \providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
 \newlabel{tab:configs}{{1}{5}{Performance of Qwen3.5-397B-A17B inference configurations on M3 Max (48\,GB). Expert bits: quantization precision. Cache: application-level LRU size. tok/s measured as average over 50+ tokens after warmup. Quality assessed by output coherence across math, code, and reasoning prompts}{table.caption.16}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Per-layer time breakdown for 2-bit + F\_NOCACHE configuration. Total: 3.14\,ms/layer $\times $ 60 layers = 188\,ms/token $\approx $ 5.3\,tok/s. Expert I/O from NVMe is the dominant cost.}}{5}{figure.caption.17}\protected@file@percent }
+\newlabel{fig:breakdown}{{1}{5}{Per-layer time breakdown for 2-bit + F\_NOCACHE configuration. Total: 3.14\,ms/layer $\times $ 60 layers = 188\,ms/token $\approx $ 5.3\,tok/s. Expert I/O from NVMe is the dominant cost}{figure.caption.17}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Expert Routing Statistics}{5}{subsection.4.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Quantization Quality}{5}{subsection.4.4}\protected@file@percent }
-\newlabel{sec:quality}{{4.4}{5}{Quantization Quality}{subsection.4.4}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces 2-bit requantization RMSE by projection type, averaged across all experts. Values represent the reconstruction error when dequantizing 2-bit weights vs.\ the original 4-bit dequantized values.}}{5}{table.caption.18}\protected@file@percent }
 \newlabel{tab:rmse}{{2}{5}{2-bit requantization RMSE by projection type, averaged across all experts. Values represent the reconstruction error when dequantizing 2-bit weights vs.\ the original 4-bit dequantized values}{table.caption.18}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.5}Expert Pruning: Top-$K$ Selection}{5}{subsection.4.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Quantization Quality}{5}{subsection.4.4}\protected@file@percent }
+\newlabel{sec:quality}{{4.4}{5}{Quantization Quality}{subsection.4.4}{}}
 \@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Effect of expert pruning ($K$) on speed and quality. Quality assessed over 200-token generations across 5 prompts.}}{6}{table.caption.19}\protected@file@percent }
 \newlabel{tab:pruning}{{3}{6}{Effect of expert pruning ($K$) on speed and quality. Quality assessed over 200-token generations across 5 prompts}{table.caption.19}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.5}Expert Pruning: Top-$K$ Selection}{6}{subsection.4.5}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.6}What Did Not Work}{6}{subsection.4.6}\protected@file@percent }
 \newlabel{sec:negative}{{4.6}{6}{What Did Not Work}{subsection.4.6}{}}
 \@writefile{toc}{\contentsline {section}{\numberline {5}Analysis}{6}{section.5}\protected@file@percent }
@@ -76,16 +76,15 @@
 \newlabel{sec:tokenizer}{{5.6}{7}{C Tokenizer}{subsection.5.6}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.7}Session Caching}{7}{subsection.5.7}\protected@file@percent }
 \newlabel{sec:session_cache}{{5.7}{7}{Session Caching}{subsection.5.7}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.8}Comparison to Prior Art}{7}{subsection.5.8}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.9}Scaling Projections}{7}{subsection.5.9}\protected@file@percent }
 \@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Optimization trajectory across 90+ experiments. Green: kept (improved or informative). Gray: discarded (regressed or broken output). The spike at experiment 64 (13.9\,tok/s) was a GPU-only benchmark without attention---not representative of end-to-end performance. The running-best line shows genuine end-to-end progress from 0.93 to 5.74\,tok/s.}}{8}{figure.caption.25}\protected@file@percent }
 \newlabel{fig:journey}{{2}{8}{Optimization trajectory across 90+ experiments. Green: kept (improved or informative). Gray: discarded (regressed or broken output). The spike at experiment 64 (13.9\,tok/s) was a GPU-only benchmark without attention---not representative of end-to-end performance. The running-best line shows genuine end-to-end progress from 0.93 to 5.74\,tok/s}{figure.caption.25}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.8}Comparison to Prior Art}{8}{subsection.5.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.9}Scaling Projections}{8}{subsection.5.9}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {6}The Optimization Journey}{8}{section.6}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {7}Discussion and Future Work}{8}{section.7}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{1-bit and ternary experts.}{8}{section*.26}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{ANE co-processing.}{8}{section*.27}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Speculative decoding.}{8}{section*.28}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Multi-device inference.}{8}{section*.29}\protected@file@percent }
 \citation{karpathy2025autoresearch}
 \bibstyle{plain}
 \bibcite{alizadeh2023llm}{1}
@@ -93,11 +92,12 @@
 \bibcite{jiang2024mixtral}{3}
 \bibcite{frantar2022gptq}{4}
 \bibcite{dettmers2023case}{5}
+\@writefile{toc}{\contentsline {paragraph}{Multi-device inference.}{9}{section*.29}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Applicability to other MoE models.}{9}{section*.30}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Conclusion}{9}{section.8}\protected@file@percent }
 \bibcite{kwon2023efficient}{6}
 \bibcite{sheng2023flexgen}{7}
 \bibcite{mlx2023}{8}
-\@writefile{toc}{\contentsline {paragraph}{Applicability to other MoE models.}{9}{section*.30}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {8}Conclusion}{9}{section.8}\protected@file@percent }
 \bibcite{llamacpp}{9}
 \bibcite{rajbhandari2021zero}{10}
 \bibcite{karpathy2025autoresearch}{11}
