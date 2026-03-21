@@ -19,6 +19,18 @@
 #include <sys/stat.h>
 #include <float.h>
 
+// Debug helpers
+static int g_debug = 0;
+static float vec_rms(const float* v, int n) {
+    float sq = 0; for (int i = 0; i < n; i++) sq += v[i]*v[i];
+    return sqrtf(sq / n);
+}
+static void dbg_vec(const char* label, const float* v, int n) {
+    if (!g_debug) return;
+    fprintf(stderr, "[DBG] %s: rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+            label, vec_rms(v, n), v[0], v[1], v[2], v[3], v[4]);
+}
+
 #include "vk_compute.h"
 #include "io_ring.h"
 #include "weights.h"
@@ -709,6 +721,59 @@ static void fused_layer_forward(
     }
     if (g_timing_enabled) { t1 = now_ms(); g_timing.input_norm += t1 - t0; }
 
+    if (g_debug && layer_idx == 0) {
+        float* h = (float*)vk_buf_map(bufs->hidden);
+        float* n = (float*)vk_buf_map(bufs->normed);
+        dbg_vec("L0 hidden (input)", h, HIDDEN_DIM);
+        dbg_vec("L0 normed", n, HIDDEN_DIM);
+
+        // CPU reference RMS norm for validation
+        float sq = 0;
+        for (int i = 0; i < HIDDEN_DIM; i++) sq += hidden[i]*hidden[i];
+        float cpu_rms = 1.0f / sqrtf(sq / HIDDEN_DIM + RMS_NORM_EPS);
+        // Read norm weight as bf16
+        uint16_t* norm_w = (uint16_t*)((char*)wf->mapped + lc->input_norm_w_off);
+        float cpu_normed[5];
+        for (int i = 0; i < 5; i++) {
+            float w = bf16_to_f32(norm_w[i]);
+            cpu_normed[i] = hidden[i] * cpu_rms * w;
+        }
+        fprintf(stderr, "[DBG] CPU ref normed first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                cpu_normed[0], cpu_normed[1], cpu_normed[2], cpu_normed[3], cpu_normed[4]);
+
+        // CPU reference QKV matvec (first 5 outputs) for validation
+        float gpu_normed[HIDDEN_DIM];
+        memcpy(gpu_normed, n, HIDDEN_DIM * sizeof(float));
+
+        uint32_t* qkv_W = (uint32_t*)((char*)wf->mapped + lc->qkv_w_off);
+        uint16_t* qkv_S = (uint16_t*)((char*)wf->mapped + lc->qkv_s_off);
+        uint16_t* qkv_B = (uint16_t*)((char*)wf->mapped + lc->qkv_b_off);
+        int packed_cols = HIDDEN_DIM / 8; // 512
+        int num_groups = HIDDEN_DIM / GROUP_SIZE; // 64
+        int ppg = GROUP_SIZE / 8; // 8
+
+        for (int row = 0; row < 5; row++) {
+            float acc = 0;
+            for (int g2 = 0; g2 < num_groups; g2++) {
+                float sc = bf16_to_f32(qkv_S[row*num_groups+g2]);
+                float bi = bf16_to_f32(qkv_B[row*num_groups+g2]);
+                for (int p2 = 0; p2 < ppg; p2++) {
+                    uint32_t pk = qkv_W[row*packed_cols + g2*ppg + p2];
+                    for (int nn = 0; nn < 8; nn++) {
+                        uint32_t nib = (pk >> (nn*4)) & 0xF;
+                        acc += ((float)nib * sc + bi) * gpu_normed[g2*GROUP_SIZE + p2*8 + nn];
+                    }
+                }
+            }
+            fprintf(stderr, "[DBG] CPU ref qkv[%d]=%.6f ", row, acc);
+        }
+        fprintf(stderr, "\n");
+
+        // Now read GPU QKV result
+        // (we need to submit the projection first - it hasn't been done yet at this point)
+        // So let's compare AFTER projections are done
+    }
+
     // =====================================================================
     // Phase 2: Attention projections (GPU)
     // =====================================================================
@@ -813,6 +878,16 @@ static void fused_layer_forward(
     }
     if (g_timing_enabled) { t1 = now_ms(); g_timing.cpu_attn += t1 - t0; }
 
+    if (g_debug && layer_idx == 0 && !is_full) {
+        float* qkv_gpu = (float*)vk_buf_map(bufs->attn_proj);
+        fprintf(stderr, "[DBG] GPU qkv first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                qkv_gpu[0], qkv_gpu[1], qkv_gpu[2], qkv_gpu[3], qkv_gpu[4]);
+    }
+    if (g_debug && layer_idx < 2) {
+        float* ao = (float*)vk_buf_map(bufs->attn_out);
+        fprintf(stderr, "[DBG] L%d attn_out: rms=%.6f\n", layer_idx, vec_rms(ao, attn_out_dim));
+    }
+
     // =====================================================================
     // Phase 4: O projection + residual add
     // =====================================================================
@@ -842,6 +917,12 @@ static void fused_layer_forward(
         vk_cmd_destroy(ctx, cmd);
     }
     if (g_timing_enabled) { t1 = now_ms(); g_timing.o_proj += t1 - t0; }
+
+    if (g_debug && layer_idx < 2) {
+        float* h = (float*)vk_buf_map(bufs->hidden);
+        fprintf(stderr, "[DBG] L%d after residual+o_proj: rms=%.6f first3=[%.6f,%.6f,%.6f]\n",
+                layer_idx, vec_rms(h, HIDDEN_DIM), h[0], h[1], h[2]);
+    }
 
     // =====================================================================
     // Phase 5: Post-attention norm + routing projection + shared expert
@@ -999,6 +1080,11 @@ static void fused_layer_forward(
 
     // Read back hidden state from GPU
     memcpy(hidden, vk_buf_map(bufs->hidden), HIDDEN_DIM * sizeof(float));
+
+    if (g_debug && layer_idx < 2) {
+        fprintf(stderr, "[DBG] L%d FINAL hidden: rms=%.6f first3=[%.6f,%.6f,%.6f]\n",
+                layer_idx, vec_rms(hidden, HIDDEN_DIM), hidden[0], hidden[1], hidden[2]);
+    }
 }
 
 // ============================================================================
@@ -1020,6 +1106,8 @@ int main(int argc, char** argv) {
             max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--timing") == 0) {
             g_timing_enabled = 1;
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            g_debug = 1;
         } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
             temperature = atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
@@ -1093,7 +1181,7 @@ int main(int argc, char** argv) {
     int expert_layers_available = 0;
     for (int i = 0; i < NUM_LAYERS; i++) {
         char path[512];
-        snprintf(path, sizeof(path), "%s/packed_experts/layer_%d.bin", model_dir, i);
+        snprintf(path, sizeof(path), "%s/packed_experts/layer_%02d.bin", model_dir, i);
         layer_fds[i] = open(path, O_RDONLY);
         if (layer_fds[i] >= 0) expert_layers_available++;
     }
@@ -1229,6 +1317,7 @@ int main(int argc, char** argv) {
 
     for (int t = 0; t < num_prompt; t++) {
         embed_lookup(wf, prompt_ids[t], hidden);
+        if (t == 0) dbg_vec("embed_lookup", hidden, HIDDEN_DIM);
 
         for (int layer = 0; layer < NUM_LAYERS; layer++) {
             int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
@@ -1266,6 +1355,8 @@ int main(int argc, char** argv) {
         memcpy(hidden, vk_buf_map(buf.normed), HIDDEN_DIM * sizeof(float));
     }
 
+    // (hidden is already after final norm here)
+
     // ---- LM head: hidden -> logits ----
     {
         memcpy(vk_buf_map(buf.normed), hidden, HIDDEN_DIM * sizeof(float));
@@ -1276,6 +1367,52 @@ int main(int argc, char** argv) {
             VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
         vk_cmd_submit(cmd);
         vk_cmd_destroy(ctx, cmd);
+        memcpy(logits, vk_buf_map(buf.logits), VOCAB_SIZE * sizeof(float));
+    }
+
+    if (g_debug) {
+        // CPU reference lm_head for first 5 outputs
+        uint32_t* lm_W = (uint32_t*)((char*)wf->mapped + lm_w_off);
+        uint16_t* lm_S = (uint16_t*)((char*)wf->mapped + lm_s_off);
+        uint16_t* lm_B = (uint16_t*)((char*)wf->mapped + lm_b_off);
+        int lm_packed = HIDDEN_DIM / 8;
+        int lm_ngroups = HIDDEN_DIM / GROUP_SIZE;
+        int lm_ppg = GROUP_SIZE / 8;
+        for (int row = 0; row < 3; row++) {
+            float acc = 0;
+            for (int g2 = 0; g2 < lm_ngroups; g2++) {
+                float sc = bf16_to_f32(lm_S[row*lm_ngroups+g2]);
+                float bi = bf16_to_f32(lm_B[row*lm_ngroups+g2]);
+                for (int p2 = 0; p2 < lm_ppg; p2++) {
+                    uint32_t pk = lm_W[row*lm_packed + g2*lm_ppg + p2];
+                    for (int nn = 0; nn < 8; nn++) {
+                        uint32_t nib = (pk >> (nn*4)) & 0xF;
+                        acc += ((float)nib * sc + bi) * hidden[g2*GROUP_SIZE + p2*8 + nn];
+                    }
+                }
+            }
+            fprintf(stderr, "[DBG] CPU lm_head[%d]=%.4f GPU=%.4f\n", row, acc, logits[row]);
+        }
+
+        // Show top-5 logits
+        fprintf(stderr, "[DBG] logits: rms=%.4f max=%.4f min=%.4f\n",
+                vec_rms(logits, VOCAB_SIZE),
+                logits[cpu_argmax(logits, VOCAB_SIZE)],
+                logits[0]); // just first for reference
+        // Top 5 tokens
+        for (int rank = 0; rank < 5; rank++) {
+            float best = -FLT_MAX;
+            int best_idx = 0;
+            for (int i = 0; i < VOCAB_SIZE; i++) {
+                int skip = 0;
+                for (int r2 = 0; r2 < rank; r2++) { /* crude but fine for debug */ }
+                if (!skip && logits[i] > best) { best = logits[i]; best_idx = i; }
+            }
+            fprintf(stderr, "[DBG] top-%d: token=%d score=%.4f '%s'\n",
+                    rank+1, best_idx, best, decode_token(&tok, best_idx));
+            logits[best_idx] = -FLT_MAX; // mark used for next iteration
+        }
+        // Restore logits (re-read from GPU)
         memcpy(logits, vk_buf_map(buf.logits), VOCAB_SIZE * sizeof(float));
     }
 
