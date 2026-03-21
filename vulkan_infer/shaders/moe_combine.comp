@@ -1,0 +1,33 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer HMid      { float h_mid[]; };
+layout(binding = 1) readonly buffer SharedOut { float shared_out[]; };
+layout(binding = 2) writeonly buffer HiddenOut{ float hidden_out[]; };
+layout(binding = 3) readonly buffer Expert0   { float expert_out0[]; };
+layout(binding = 4) readonly buffer Expert1   { float expert_out1[]; };
+layout(binding = 5) readonly buffer Expert2   { float expert_out2[]; };
+layout(binding = 6) readonly buffer Expert3   { float expert_out3[]; };
+// params[0..3] = expert weights, params[4] = shared_gate_score
+layout(binding = 7) readonly buffer Params    { float params[]; };
+
+layout(push_constant) uniform PC {
+    uint dim;
+    uint K;   // number of active experts (always 4 in this engine)
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= dim) return;
+
+    float shared_gate = 1.0 / (1.0 + exp(-params[4]));
+
+    float moe = 0.0;
+    if (K > 0u) moe += params[0] * expert_out0[i];
+    if (K > 1u) moe += params[1] * expert_out1[i];
+    if (K > 2u) moe += params[2] * expert_out2[i];
+    if (K > 3u) moe += params[3] * expert_out3[i];
+
+    hidden_out[i] = h_mid[i] + moe + shared_gate * shared_out[i];
+}

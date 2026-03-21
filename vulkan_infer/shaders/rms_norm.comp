@@ -1,0 +1,62 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer X       { float x[]; };
+layout(binding = 1) readonly buffer Weight  { uint  weight_raw[]; };  // bf16 packed as uint
+layout(binding = 2) writeonly buffer Out    { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint  dim;
+    float eps;
+};
+
+// Shared array sized for max subgroups: 256 threads / min_subgroup_size(32) = 8 max
+shared float partial[8];
+
+float bf16_to_f32(uint raw_pair, uint which) {
+    uint bf16 = (which == 0u) ? (raw_pair & 0xFFFFu) : (raw_pair >> 16u);
+    return uintBitsToFloat(bf16 << 16u);
+}
+
+void main() {
+    uint lid        = gl_LocalInvocationID.x;
+    uint subgroup_sz = gl_SubgroupSize;
+    uint simd_lane  = gl_SubgroupInvocationID;
+    uint simd_group = gl_SubgroupID;
+    uint num_subgroups = 256u / subgroup_sz;
+
+    // --- Pass 1: sum of squares ---
+    float acc = 0.0;
+    for (uint i = lid; i < dim; i += 256u) {
+        float v = x[i];
+        acc += v * v;
+    }
+
+    float sg_sum = subgroupAdd(acc);
+    if (simd_lane == 0u) {
+        partial[simd_group] = sg_sum;
+    }
+    barrier();
+
+    // Final reduction across subgroups — first subgroup does it
+    float sum_sq = 0.0;
+    if (simd_group == 0u) {
+        float val = (simd_lane < num_subgroups) ? partial[simd_lane] : 0.0;
+        sum_sq = subgroupAdd(val);
+    }
+    // Broadcast sum_sq to all threads via shared memory
+    if (lid == 0u) {
+        partial[0] = sum_sq;
+    }
+    barrier();
+    sum_sq = partial[0];
+
+    // --- Pass 2: normalize and apply weight ---
+    float rms = inversesqrt(sum_sq / float(dim) + eps);
+    for (uint i = lid; i < dim; i += 256u) {
+        float w = bf16_to_f32(weight_raw[i / 2u], i & 1u);
+        out_data[i] = x[i] * rms * w;
+    }
+}

@@ -1,0 +1,60 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Q       { float q_data[]; };      // [num_heads, head_dim]
+layout(binding = 1) readonly buffer KCache  { float k_cache[]; };     // [max_seq, kv_dim]
+layout(binding = 2) writeonly buffer Scores { float scores[]; };      // [num_heads, seq_stride]
+
+layout(push_constant) uniform Params {
+    uint  head_dim;       // 256
+    uint  kv_dim;         // 512
+    uint  seq_len;        // current sequence length
+    uint  seq_stride;     // MAX_SEQ_LEN
+    float scale;          // 1/sqrt(head_dim)
+    uint  heads_per_kv;   // 16 (GQA ratio)
+    uint  num_seq_tgs;    // = seq_len
+};
+
+// Shared array for cross-subgroup reduction, sized for up to 8 subgroups
+shared float partial[8];
+
+void main() {
+    uint tgid        = gl_WorkGroupID.x;   // linearized: pos + h * num_seq_tgs
+    uint lid         = gl_LocalInvocationID.x;
+    uint simd_lane   = gl_SubgroupInvocationID;
+    uint simd_group  = gl_SubgroupID;
+    uint subgroup_sz = gl_SubgroupSize;
+    uint num_subgroups = 256u / subgroup_sz;
+
+    uint pos = tgid % num_seq_tgs;
+    uint h   = tgid / num_seq_tgs;
+    if (pos >= seq_len) return;
+
+    uint kv_h = h / heads_per_kv;
+
+    // Dot product Q[h, :] . K[pos, kv_h * head_dim : ]
+    uint q_base = h    * head_dim;
+    uint k_base = pos  * kv_dim + kv_h * head_dim;
+
+    float acc = 0.0;
+    for (uint d = lid; d < head_dim; d += 256u) {
+        acc += q_data[q_base + d] * k_cache[k_base + d];
+    }
+
+    // Two-level reduction: subgroup → shared → first subgroup
+    float sg_val = subgroupAdd(acc);
+    if (simd_lane == 0u) {
+        partial[simd_group] = sg_val;
+    }
+    barrier();
+
+    if (simd_group == 0u) {
+        float val = (simd_lane < num_subgroups) ? partial[simd_lane] : 0.0;
+        float total = subgroupAdd(val);
+        if (simd_lane == 0u) {
+            scores[h * seq_stride + pos] = total * scale;
+        }
+    }
+}

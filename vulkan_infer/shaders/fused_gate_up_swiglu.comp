@@ -1,0 +1,110 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+// Gate projection weights (4-bit packed)
+layout(binding = 0) readonly buffer GateW      { uint gate_w[]; };
+layout(binding = 1) readonly buffer GateScales { uint gate_scales_raw[]; };
+layout(binding = 2) readonly buffer GateBiases { uint gate_biases_raw[]; };
+// Up projection weights (4-bit packed)
+layout(binding = 3) readonly buffer UpW        { uint up_w[]; };
+layout(binding = 4) readonly buffer UpScales   { uint up_scales_raw[]; };
+layout(binding = 5) readonly buffer UpBiases   { uint up_biases_raw[]; };
+// Input and output
+layout(binding = 6) readonly buffer X          { float x[]; };
+layout(binding = 7) writeonly buffer Out       { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint out_dim;    // 1024
+    uint in_dim;     // 4096
+    uint group_size; // 64
+};
+
+// Shared input vector cache (max in_dim = 4096 floats = 16KB)
+shared float x_shared[4096];
+// Shared accumulators for cross-subgroup reduction
+shared float sg_gate[8];
+shared float sg_up[8];
+
+float bf16_to_f32(uint raw_pair, uint which) {
+    uint bf16 = (which == 0u) ? (raw_pair & 0xFFFFu) : (raw_pair >> 16u);
+    return uintBitsToFloat(bf16 << 16u);
+}
+
+void main() {
+    uint lid         = gl_LocalInvocationID.x;
+    uint tgid        = gl_WorkGroupID.x;
+    uint simd_lane   = gl_SubgroupInvocationID;
+    uint simd_group  = gl_SubgroupID;
+    uint subgroup_sz = gl_SubgroupSize;
+    uint num_subgroups = 256u / subgroup_sz;
+
+    // rows_per_tg: how many output rows this workgroup handles (wave64 → 4, wave32 → 8)
+    uint rows_per_tg = num_subgroups;
+    uint row = tgid * rows_per_tg + simd_group;
+
+    // All threads cooperatively load input into shared memory
+    for (uint i = lid; i < in_dim; i += 256u) {
+        x_shared[i] = x[i];
+    }
+    barrier();
+
+    if (row >= out_dim) return;
+
+    uint packed_cols = in_dim / 8u;
+    uint num_groups  = in_dim / group_size;
+    uint packed_per_group = group_size / 8u;
+
+    uint gate_row_base = row * packed_cols;
+    uint up_row_base   = row * packed_cols;
+    uint s_row_base    = row * num_groups;
+
+    float gate_acc = 0.0;
+    float up_acc   = 0.0;
+
+    for (uint col = simd_lane; col < packed_cols; col += subgroup_sz) {
+        uint g     = col / packed_per_group;
+        uint s_idx = s_row_base + g;
+
+        float gsc = bf16_to_f32(gate_scales_raw[s_idx / 2u], s_idx & 1u);
+        float gbi = bf16_to_f32(gate_biases_raw[s_idx / 2u], s_idx & 1u);
+        float usc = bf16_to_f32(up_scales_raw  [s_idx / 2u], s_idx & 1u);
+        float ubi = bf16_to_f32(up_biases_raw  [s_idx / 2u], s_idx & 1u);
+
+        uint gp = gate_w[gate_row_base + col];
+        uint up = up_w  [up_row_base   + col];
+        uint x_base = col * 8u;
+
+        // FMA: precompute scale*x and bias*x for each of 8 elements
+        for (uint i = 0u; i < 8u; i++) {
+            float xv  = x_shared[x_base + i];
+            float gni = float((gp >> (i * 4u)) & 0xFu);
+            float uni = float((up >> (i * 4u)) & 0xFu);
+            gate_acc += fma(gni, gsc * xv, gbi * xv);
+            up_acc   += fma(uni, usc * xv, ubi * xv);
+        }
+    }
+
+    // Subgroup reduction
+    float sg_g = subgroupAdd(gate_acc);
+    float sg_u = subgroupAdd(up_acc);
+
+    if (simd_lane == 0u) {
+        sg_gate[simd_group] = sg_g;
+        sg_up  [simd_group] = sg_u;
+    }
+    barrier();
+
+    // First lane of each subgroup-group reads back its own slot — only simd_group's
+    // first lane writes the output. We need to cross-reduce only within the rows_per_tg
+    // subgroups that belong to the same row (in this design, exactly one subgroup = one row).
+    // No cross-subgroup reduction needed since each row is owned by exactly one subgroup.
+    if (simd_lane == 0u) {
+        float gv = sg_gate[simd_group];
+        float uv = sg_up  [simd_group];
+        // SiLU: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+        float silu_g = gv / (1.0 + exp(-gv));
+        out_data[row] = silu_g * uv;
+    }
+}

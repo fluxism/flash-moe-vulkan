@@ -1,0 +1,76 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) buffer Scores { float scores[]; };  // [num_heads, seq_stride]
+
+layout(push_constant) uniform Params {
+    uint seq_len;
+    uint seq_stride;
+};
+
+// Shared arrays for cross-subgroup reductions (max 8 subgroups)
+shared float partial[8];
+shared float broadcast_val;
+
+void main() {
+    uint tgid        = gl_WorkGroupID.x;   // head index
+    uint lid         = gl_LocalInvocationID.x;
+    uint simd_lane   = gl_SubgroupInvocationID;
+    uint simd_group  = gl_SubgroupID;
+    uint subgroup_sz = gl_SubgroupSize;
+    uint num_subgroups = 256u / subgroup_sz;
+
+    uint base = tgid * seq_stride;
+
+    // --- Pass 1: find global max ---
+    float local_max = -1.0e30;
+    for (uint i = lid; i < seq_len; i += 256u) {
+        local_max = max(local_max, scores[base + i]);
+    }
+
+    float sg_max = subgroupMax(local_max);
+    if (simd_lane == 0u) {
+        partial[simd_group] = sg_max;
+    }
+    barrier();
+
+    float global_max = -1.0e30;
+    if (simd_group == 0u) {
+        float val = (simd_lane < num_subgroups) ? partial[simd_lane] : -1.0e30;
+        global_max = subgroupMax(val);
+    }
+    if (lid == 0u) broadcast_val = global_max;
+    barrier();
+    global_max = broadcast_val;
+
+    // --- Pass 2: exp(x - max) and accumulate sum ---
+    float local_sum = 0.0;
+    for (uint i = lid; i < seq_len; i += 256u) {
+        float val = exp(scores[base + i] - global_max);
+        scores[base + i] = val;
+        local_sum += val;
+    }
+
+    float sg_sum = subgroupAdd(local_sum);
+    if (simd_lane == 0u) {
+        partial[simd_group] = sg_sum;
+    }
+    barrier();
+
+    float global_sum = 0.0;
+    if (simd_group == 0u) {
+        float val = (simd_lane < num_subgroups) ? partial[simd_lane] : 0.0;
+        global_sum = subgroupAdd(val);
+    }
+    if (lid == 0u) broadcast_val = global_sum;
+    barrier();
+    global_sum = broadcast_val;
+
+    // --- Pass 3: normalize ---
+    float inv_sum = 1.0 / global_sum;
+    for (uint i = lid; i < seq_len; i += 256u) {
+        scores[base + i] *= inv_sum;
+    }
+}
