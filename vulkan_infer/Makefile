@@ -1,7 +1,7 @@
 # Makefile for vulkan_infer — Vulkan/Linux MoE inference engine
 CC = gcc
 CFLAGS = -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -Ideps
-LDFLAGS = -ldl -luring -lopenblas -lpthread -lm
+LDFLAGS = -ldl -luring -lcblas -lblas -lpthread -lm
 
 GLSLC = glslc
 

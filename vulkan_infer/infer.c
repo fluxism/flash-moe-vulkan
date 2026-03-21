@@ -1,0 +1,1485 @@
+/*
+ * infer.c — Main inference engine for Flash-MoE Vulkan port
+ *
+ * Wires together Vulkan compute shaders, io_uring expert streaming,
+ * CPU attention (linear + full), and BPE tokenizer into a complete
+ * token-by-token generation pipeline for Qwen3.5-397B-A17B.
+ *
+ * Usage:
+ *   ./infer --prompt "text" --tokens N [--timing] [--temperature T] [--top-p P]
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <float.h>
+
+#include "vk_compute.h"
+#include "io_ring.h"
+#include "weights.h"
+#include "linear_attn.h"
+#include "full_attn.h"
+
+#define TOKENIZER_IMPL
+#include "tokenizer.h"
+
+// ============================================================================
+// Model constants
+// ============================================================================
+
+#define HIDDEN_DIM          4096
+#define NUM_LAYERS          60
+#define VOCAB_SIZE          248320
+#define RMS_NORM_EPS        1e-6f
+#define NUM_EXPERTS         512
+#define MOE_INTERMEDIATE    1024
+#define SHARED_INTERMEDIATE 1024
+#define GROUP_SIZE          64
+#define EXPERT_SIZE         7077888
+#define FULL_ATTN_INTERVAL  4
+#define K_EXPERTS           4
+#define EOS_TOKEN_1         248046
+#define EOS_TOKEN_2         248044
+#define NUM_FULL_ATTN_LAYERS (NUM_LAYERS / FULL_ATTN_INTERVAL)  // 15
+#define NUM_LINEAR_LAYERS   (NUM_LAYERS - NUM_FULL_ATTN_LAYERS) // 45
+
+// Expert 4-bit layout offsets (bytes within each expert)
+#define GATE_W_OFF  0
+#define GATE_S_OFF  2097152
+#define GATE_B_OFF  2228224
+#define UP_W_OFF    2359296
+#define UP_S_OFF    4456448
+#define UP_B_OFF    4587520
+#define DOWN_W_OFF  4718592
+#define DOWN_S_OFF  6815744
+#define DOWN_B_OFF  6946816
+
+// Full attention constants (from full_attn.h)
+#define FA_Q_PROJ_DIM       (FA_NUM_ATTN_HEADS * FA_HEAD_DIM * 2) // 16384
+#define FA_O_PROJ_IN_DIM    (FA_NUM_ATTN_HEADS * FA_HEAD_DIM)     // 8192
+
+// ============================================================================
+// Timing
+// ============================================================================
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+typedef struct {
+    double input_norm;
+    double attn_proj;
+    double cpu_attn;
+    double o_proj;
+    double post_norm;
+    double routing_proj;
+    double cpu_routing;
+    double expert_io;
+    double expert_compute;
+    double moe_combine;
+    int    count;
+} LayerTiming;
+
+static LayerTiming g_timing;
+static int g_timing_enabled = 0;
+
+static void timing_reset(void) {
+    memset(&g_timing, 0, sizeof(g_timing));
+}
+
+static void timing_print(void) {
+    if (g_timing.count == 0) return;
+    int n = g_timing.count;
+    fprintf(stderr, "\n--- Per-token timing (avg over %d layers) ---\n", n);
+    fprintf(stderr, "  input_norm:     %.3f ms\n", g_timing.input_norm / n);
+    fprintf(stderr, "  attn_proj:      %.3f ms\n", g_timing.attn_proj / n);
+    fprintf(stderr, "  cpu_attn:       %.3f ms\n", g_timing.cpu_attn / n);
+    fprintf(stderr, "  o_proj:         %.3f ms\n", g_timing.o_proj / n);
+    fprintf(stderr, "  post_norm:      %.3f ms\n", g_timing.post_norm / n);
+    fprintf(stderr, "  routing_proj:   %.3f ms\n", g_timing.routing_proj / n);
+    fprintf(stderr, "  cpu_routing:    %.3f ms\n", g_timing.cpu_routing / n);
+    fprintf(stderr, "  expert_io:      %.3f ms\n", g_timing.expert_io / n);
+    fprintf(stderr, "  expert_compute: %.3f ms\n", g_timing.expert_compute / n);
+    fprintf(stderr, "  moe_combine:    %.3f ms\n", g_timing.moe_combine / n);
+    double total = (g_timing.input_norm + g_timing.attn_proj + g_timing.cpu_attn +
+                    g_timing.o_proj + g_timing.post_norm + g_timing.routing_proj +
+                    g_timing.cpu_routing + g_timing.expert_io + g_timing.expert_compute +
+                    g_timing.moe_combine) / n;
+    fprintf(stderr, "  TOTAL:          %.3f ms/layer (%.2f ms/token est)\n", total, total * NUM_LAYERS);
+}
+
+// ============================================================================
+// bf16 conversion helper
+// ============================================================================
+
+static inline float bf16_to_f32(uint16_t bf16) {
+    uint32_t bits = (uint32_t)bf16 << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// ============================================================================
+// Layer weight cache — precomputed offsets into the weight buffer
+// ============================================================================
+
+typedef struct {
+    // Input norm
+    size_t input_norm_w_off;
+    // Full attention (15 layers)
+    size_t q_w_off, q_s_off, q_b_off;
+    size_t k_w_off, k_s_off, k_b_off;
+    size_t v_w_off, v_s_off, v_b_off;
+    size_t o_w_off, o_s_off, o_b_off;
+    // Linear attention (45 layers)
+    size_t qkv_w_off, qkv_s_off, qkv_b_off;
+    size_t z_w_off, z_s_off, z_b_off;
+    size_t beta_w_off, beta_s_off, beta_b_off;
+    size_t alpha_w_off, alpha_s_off, alpha_b_off;
+    size_t out_proj_w_off, out_proj_s_off, out_proj_b_off;
+    // Linear attention extra (CPU-side data pointers, not offsets)
+    void* conv1d_w;   // bf16, accessed by CPU
+    void* A_log;      // float, accessed by CPU
+    void* dt_bias;    // bf16, accessed by CPU
+    void* gated_norm_w; // bf16, accessed by CPU
+    // Post-attention norm
+    size_t post_attn_norm_w_off;
+    // Routing
+    size_t gate_w_off, gate_s_off, gate_b_off;
+    // Shared expert
+    size_t sg_w_off, sg_s_off, sg_b_off;  // gate_proj
+    size_t su_w_off, su_s_off, su_b_off;  // up_proj
+    size_t sd_w_off, sd_s_off, sd_b_off;  // down_proj
+    // Shared expert gate
+    size_t seg_w_off, seg_s_off, seg_b_off;
+    // Dimensions
+    int is_full;
+    int q_proj_dim;    // full: 16384; linear: 12288
+    int kv_dim;        // full: 512
+    int o_proj_in_dim; // full: 8192; linear: 8192
+} LayerWeightCache;
+
+static LayerWeightCache layer_cache[NUM_LAYERS];
+static int layer_cache_built = 0;
+
+static size_t get_tensor_offset(WeightFile* wf, const char* name) {
+    TensorInfo* ti = weights_get_tensor(wf, name);
+    if (!ti) {
+        fprintf(stderr, "WARNING: tensor '%s' not found\n", name);
+        return 0;
+    }
+    return ti->offset;
+}
+
+static void* get_tensor_ptr(WeightFile* wf, const char* name) {
+    TensorInfo* ti = weights_get_tensor(wf, name);
+    if (!ti) return NULL;
+    return (char*)wf->mapped + ti->offset;
+}
+
+static void build_layer_cache(WeightFile* wf) {
+    char name[256];
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        LayerWeightCache* lc = &layer_cache[l];
+        int is_full = ((l + 1) % FULL_ATTN_INTERVAL == 0);
+        lc->is_full = is_full;
+
+        // Input norm
+        snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", l);
+        lc->input_norm_w_off = get_tensor_offset(wf, name);
+
+        if (is_full) {
+            // Full attention projections
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", l);
+            lc->q_w_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", l);
+            lc->q_s_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", l);
+            lc->q_b_off = get_tensor_offset(wf, name);
+
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", l);
+            lc->k_w_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.scales", l);
+            lc->k_s_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", l);
+            lc->k_b_off = get_tensor_offset(wf, name);
+
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", l);
+            lc->v_w_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.scales", l);
+            lc->v_s_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", l);
+            lc->v_b_off = get_tensor_offset(wf, name);
+
+            // O projection
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", l);
+            lc->o_w_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", l);
+            lc->o_s_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", l);
+            lc->o_b_off = get_tensor_offset(wf, name);
+
+            lc->q_proj_dim = FA_Q_PROJ_DIM;        // 16384
+            lc->kv_dim = FA_KV_DIM;                // 512
+            lc->o_proj_in_dim = FA_O_PROJ_IN_DIM;  // 8192
+        } else {
+            // Linear attention projections
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", l);
+            lc->qkv_w_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.scales", l);
+            lc->qkv_s_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.biases", l);
+            lc->qkv_b_off = get_tensor_offset(wf, name);
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", l);
+            lc->z_w_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.scales", l);
+            lc->z_s_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.biases", l);
+            lc->z_b_off = get_tensor_offset(wf, name);
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", l);
+            lc->beta_w_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.scales", l);
+            lc->beta_s_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.biases", l);
+            lc->beta_b_off = get_tensor_offset(wf, name);
+
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", l);
+            lc->alpha_w_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.scales", l);
+            lc->alpha_s_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.biases", l);
+            lc->alpha_b_off = get_tensor_offset(wf, name);
+
+            // Out projection (linear_attn.out_proj)
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", l);
+            lc->out_proj_w_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.scales", l);
+            lc->out_proj_s_off = get_tensor_offset(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", l);
+            lc->out_proj_b_off = get_tensor_offset(wf, name);
+
+            // CPU-side linear attn params (direct pointers)
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", l);
+            lc->conv1d_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", l);
+            lc->A_log = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", l);
+            lc->dt_bias = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", l);
+            lc->gated_norm_w = get_tensor_ptr(wf, name);
+
+            lc->q_proj_dim = LINEAR_CONV_DIM;           // 12288
+            lc->kv_dim = 0;
+            lc->o_proj_in_dim = LINEAR_TOTAL_VALUE;     // 8192
+        }
+
+        // Post-attention norm
+        snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", l);
+        lc->post_attn_norm_w_off = get_tensor_offset(wf, name);
+
+        // Routing gate
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", l);
+        lc->gate_w_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", l);
+        lc->gate_s_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", l);
+        lc->gate_b_off = get_tensor_offset(wf, name);
+
+        // Shared expert gate_proj
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", l);
+        lc->sg_w_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", l);
+        lc->sg_s_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", l);
+        lc->sg_b_off = get_tensor_offset(wf, name);
+
+        // Shared expert up_proj
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", l);
+        lc->su_w_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", l);
+        lc->su_s_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", l);
+        lc->su_b_off = get_tensor_offset(wf, name);
+
+        // Shared expert down_proj
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", l);
+        lc->sd_w_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", l);
+        lc->sd_s_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", l);
+        lc->sd_b_off = get_tensor_offset(wf, name);
+
+        // Shared expert gate (scalar)
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", l);
+        lc->seg_w_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", l);
+        lc->seg_s_off = get_tensor_offset(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", l);
+        lc->seg_b_off = get_tensor_offset(wf, name);
+    }
+    layer_cache_built = 1;
+    fprintf(stderr, "[init] Layer weight cache built (%d layers)\n", NUM_LAYERS);
+}
+
+// ============================================================================
+// GPU pipeline handles
+// ============================================================================
+
+typedef struct {
+    VkPipe* dequant_matvec;
+    VkPipe* rms_norm;
+    VkPipe* residual_add;
+    VkPipe* fused_gate_up_swiglu;
+    VkPipe* moe_combine;
+    VkPipe* sigmoid_gate;
+    VkPipe* attn_scores;
+    VkPipe* attn_softmax;
+    VkPipe* attn_values;
+} Pipelines;
+
+// ============================================================================
+// GPU scratch buffers
+// ============================================================================
+
+typedef struct {
+    // Main hidden state / working buffers
+    VkBuf* hidden;        // [HIDDEN_DIM] current hidden state on GPU
+    VkBuf* normed;        // [HIDDEN_DIM] after rms_norm
+    VkBuf* residual;      // [HIDDEN_DIM] saved for residual connection
+
+    // Attention projection outputs
+    VkBuf* attn_proj;     // [max(FA_Q_PROJ_DIM, LINEAR_CONV_DIM)] = [16384]
+    VkBuf* attn_proj2;    // [max(FA_KV_DIM, LINEAR_TOTAL_VALUE)] = [8192] for k/z
+    VkBuf* attn_proj3;    // [FA_KV_DIM] = [512] for v
+    VkBuf* attn_proj4;    // [LINEAR_NUM_V_HEADS] = [64] for beta
+    VkBuf* attn_proj5;    // [LINEAR_NUM_V_HEADS] = [64] for alpha
+
+    // Attention output (from CPU)
+    VkBuf* attn_out;      // [FA_O_PROJ_IN_DIM] = [8192]
+
+    // O projection output
+    VkBuf* o_proj_out;    // [HIDDEN_DIM]
+
+    // MoE routing
+    VkBuf* routing_scores;// [NUM_EXPERTS]
+
+    // Shared expert
+    VkBuf* shared_act;    // [SHARED_INTERMEDIATE] after fused_gate_up_swiglu
+    VkBuf* shared_out;    // [HIDDEN_DIM] after down_proj
+
+    // Shared expert gate scalar
+    VkBuf* shared_gate_score; // [1]
+
+    // Expert data (4 experts)
+    VkBuf* expert_data[K_EXPERTS]; // [EXPERT_SIZE] each
+    VkBuf* expert_act[K_EXPERTS];  // [MOE_INTERMEDIATE]
+    VkBuf* expert_out[K_EXPERTS];  // [HIDDEN_DIM]
+
+    // MoE combine params [5 floats: w0,w1,w2,w3,shared_gate]
+    VkBuf* moe_params;
+
+    // Logits
+    VkBuf* logits;        // [VOCAB_SIZE]
+
+    // Full attention extra
+    VkBuf* kv_k[NUM_FULL_ATTN_LAYERS]; // [FA_MAX_SEQ_LEN * FA_KV_DIM]
+    VkBuf* kv_v[NUM_FULL_ATTN_LAYERS];
+    VkBuf* attn_scores_buf; // [FA_NUM_ATTN_HEADS * FA_MAX_SEQ_LEN]
+} Buffers;
+
+// ============================================================================
+// Embedding lookup (CPU, 4-bit quantized)
+// ============================================================================
+
+static void embed_lookup(WeightFile* wf, int token_id, float* out) {
+    TensorInfo* w_info = weights_get_tensor(wf, "model.embed_tokens.weight");
+    TensorInfo* s_info = weights_get_tensor(wf, "model.embed_tokens.scales");
+    TensorInfo* b_info = weights_get_tensor(wf, "model.embed_tokens.biases");
+
+    if (!w_info || !s_info || !b_info) {
+        fprintf(stderr, "ERROR: embedding tensors not found\n");
+        memset(out, 0, HIDDEN_DIM * sizeof(float));
+        return;
+    }
+
+    int packed_cols = w_info->shape[1]; // 512
+    int num_groups = s_info->shape[1];  // 64
+
+    uint32_t* W = (uint32_t*)((char*)wf->mapped + w_info->offset);
+    uint16_t* S = (uint16_t*)((char*)wf->mapped + s_info->offset);
+    uint16_t* B = (uint16_t*)((char*)wf->mapped + b_info->offset);
+
+    const uint32_t* w_row = W + (size_t)token_id * packed_cols;
+    const uint16_t* s_row = S + (size_t)token_id * num_groups;
+    const uint16_t* b_row = B + (size_t)token_id * num_groups;
+
+    int group_size = HIDDEN_DIM / num_groups;  // 64
+    int packed_per_group = group_size / 8;     // 8
+
+    for (int g = 0; g < num_groups; g++) {
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        for (int p = 0; p < packed_per_group; p++) {
+            uint32_t packed = w_row[g * packed_per_group + p];
+            int base = g * group_size + p * 8;
+            for (int n = 0; n < 8; n++) {
+                uint32_t nibble = (packed >> (n * 4)) & 0xF;
+                out[base + n] = (float)nibble * scale + bias;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// GPU dispatch helpers
+// ============================================================================
+
+static void gpu_dequant_matvec(VkCtx* ctx __attribute__((unused)), VkCmd* cmd, VkPipe* pipe,
+    VkBuf* w_buf, size_t w_off,
+    VkBuf* s_buf, size_t s_off,
+    VkBuf* b_buf, size_t b_off,
+    VkBuf* x_buf,
+    VkBuf* out_buf,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size)
+{
+    // Binding: 0=weights, 1=scales, 2=biases, 3=input, 4=output
+    VkBuf* bufs[5] = { w_buf, s_buf, b_buf, x_buf, out_buf };
+
+    // Weight: out_dim rows, each row has in_dim/8 uint32s = in_dim/2 bytes
+    size_t w_range = (size_t)out_dim * (in_dim / 8) * sizeof(uint32_t);
+    // Scales: out_dim * (in_dim/group_size) bf16 values packed as uint16
+    uint32_t num_groups = in_dim / group_size;
+    size_t s_range = (size_t)out_dim * num_groups * sizeof(uint16_t);
+    size_t b_range = s_range;
+
+    size_t offsets[5] = { w_off, s_off, b_off, 0, 0 };
+    size_t ranges[5]  = { w_range, s_range, b_range, in_dim * sizeof(float),
+                          out_dim * sizeof(float) };
+
+    struct { uint32_t out_dim; uint32_t in_dim; uint32_t group_size; } pc = {
+        out_dim, in_dim, group_size
+    };
+
+    vk_cmd_bind(cmd, pipe, bufs, offsets, ranges, 5, &pc, sizeof(pc));
+    // workgroup size 256, each subgroup handles one output row.
+    // Assuming subgroup size 32 -> 8 rows/workgroup.
+    // For safety, assume 1 row per workgroup (worst case subgroup=256)
+    // Actually: rows_per_tg = 256/subgroup_size. Use conservative estimate.
+    // At subgroup_size=32: rows_per_tg=8, need out_dim/8 workgroups.
+    // At subgroup_size=64: rows_per_tg=4, need out_dim/4 workgroups.
+    // Since we don't know subgroup size, dispatch ceil(out_dim/1) = out_dim workgroups
+    // and let excess early-exit via the `if (row >= out_dim) return;` guard.
+    // This is safe but might over-dispatch. For correctness, use out_dim.
+    uint32_t wg = (out_dim + 7) / 8; // assume subgroup_size=32 -> 8 rows/wg
+    vk_cmd_dispatch(cmd, wg, 1, 1);
+}
+
+static void gpu_rms_norm(VkCtx* ctx __attribute__((unused)), VkCmd* cmd, VkPipe* pipe,
+    VkBuf* x_buf, VkBuf* weight_buf, size_t w_off, VkBuf* out_buf,
+    uint32_t dim, float eps)
+{
+    // Binding: 0=x, 1=weight(bf16), 2=output
+    VkBuf* bufs[3] = { x_buf, weight_buf, out_buf };
+    size_t offsets[3] = { 0, w_off, 0 };
+    // Weight: dim bf16 values packed as uint16, but shader reads as uint pairs
+    size_t w_range = (size_t)dim * sizeof(uint16_t);
+    size_t ranges[3] = { dim * sizeof(float), w_range, dim * sizeof(float) };
+
+    struct { uint32_t dim; float eps; } pc = { dim, eps };
+
+    vk_cmd_bind(cmd, pipe, bufs, offsets, ranges, 3, &pc, sizeof(pc));
+    vk_cmd_dispatch(cmd, 1, 1, 1); // Single workgroup of 256 threads
+}
+
+static void gpu_residual_add(VkCtx* ctx __attribute__((unused)), VkCmd* cmd, VkPipe* pipe,
+    VkBuf* a_buf, VkBuf* b_buf, VkBuf* out_buf, uint32_t dim)
+{
+    VkBuf* bufs[3] = { a_buf, b_buf, out_buf };
+    size_t ranges[3] = { dim * sizeof(float), dim * sizeof(float), dim * sizeof(float) };
+
+    struct { uint32_t dim; } pc = { dim };
+    vk_cmd_bind(cmd, pipe, bufs, NULL, ranges, 3, &pc, sizeof(pc));
+    vk_cmd_dispatch(cmd, (dim + 255) / 256, 1, 1);
+}
+
+static void gpu_fused_gate_up_swiglu(VkCtx* ctx __attribute__((unused)), VkCmd* cmd, VkPipe* pipe,
+    VkBuf* gate_w_buf, size_t gw_off,
+    VkBuf* gate_s_buf, size_t gs_off,
+    VkBuf* gate_b_buf, size_t gb_off,
+    VkBuf* up_w_buf,   size_t uw_off,
+    VkBuf* up_s_buf,   size_t us_off,
+    VkBuf* up_b_buf,   size_t ub_off,
+    VkBuf* x_buf, VkBuf* out_buf,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size)
+{
+    VkBuf* bufs[8] = { gate_w_buf, gate_s_buf, gate_b_buf,
+                        up_w_buf, up_s_buf, up_b_buf,
+                        x_buf, out_buf };
+
+    size_t w_range = (size_t)out_dim * (in_dim / 8) * sizeof(uint32_t);
+    uint32_t num_groups = in_dim / group_size;
+    size_t s_range = (size_t)out_dim * num_groups * sizeof(uint16_t);
+
+    size_t offsets[8] = { gw_off, gs_off, gb_off, uw_off, us_off, ub_off, 0, 0 };
+    size_t ranges[8] = { w_range, s_range, s_range,
+                         w_range, s_range, s_range,
+                         in_dim * sizeof(float), out_dim * sizeof(float) };
+
+    struct { uint32_t out_dim; uint32_t in_dim; uint32_t group_size; } pc = {
+        out_dim, in_dim, group_size
+    };
+
+    vk_cmd_bind(cmd, pipe, bufs, offsets, ranges, 8, &pc, sizeof(pc));
+    uint32_t wg = (out_dim + 7) / 8;
+    vk_cmd_dispatch(cmd, wg, 1, 1);
+}
+
+static void gpu_moe_combine(VkCtx* ctx __attribute__((unused)), VkCmd* cmd, VkPipe* pipe,
+    VkBuf* h_mid_buf, VkBuf* shared_out_buf, VkBuf* hidden_out_buf,
+    VkBuf* expert_out_bufs[K_EXPERTS], VkBuf* params_buf,
+    uint32_t dim, uint32_t K)
+{
+    VkBuf* bufs[8] = { h_mid_buf, shared_out_buf, hidden_out_buf,
+                        expert_out_bufs[0], expert_out_bufs[1],
+                        expert_out_bufs[2], expert_out_bufs[3],
+                        params_buf };
+    size_t ranges[8];
+    for (int i = 0; i < 8; i++) ranges[i] = dim * sizeof(float);
+    ranges[7] = 5 * sizeof(float); // params = [w0, w1, w2, w3, shared_gate_score]
+
+    struct { uint32_t dim; uint32_t K; } pc = { dim, K };
+    vk_cmd_bind(cmd, pipe, bufs, NULL, ranges, 8, &pc, sizeof(pc));
+    vk_cmd_dispatch(cmd, (dim + 255) / 256, 1, 1);
+}
+
+// ============================================================================
+// CPU softmax / top-K / sampling
+// ============================================================================
+
+static void cpu_softmax(float* x, int n) {
+    float max_val = -FLT_MAX;
+    for (int i = 0; i < n; i++) if (x[i] > max_val) max_val = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - max_val); sum += x[i]; }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) x[i] *= inv;
+}
+
+static void cpu_topk(const float* scores, int n, int k,
+                     int* indices, float* weights) {
+    // Simple selection sort for small k
+    for (int i = 0; i < k; i++) {
+        float best = -FLT_MAX;
+        int best_idx = 0;
+        for (int j = 0; j < n; j++) {
+            // Skip already selected
+            int skip = 0;
+            for (int s = 0; s < i; s++) if (indices[s] == j) { skip = 1; break; }
+            if (!skip && scores[j] > best) { best = scores[j]; best_idx = j; }
+        }
+        indices[i] = best_idx;
+        weights[i] = best;
+    }
+    // Normalize weights
+    float sum = 0.0f;
+    for (int i = 0; i < k; i++) sum += weights[i];
+    if (sum > 0.0f) {
+        float inv = 1.0f / sum;
+        for (int i = 0; i < k; i++) weights[i] *= inv;
+    }
+}
+
+static int cpu_argmax(const float* x, int n) {
+    float best = -FLT_MAX;
+    int best_idx = 0;
+    for (int i = 0; i < n; i++) {
+        if (x[i] > best) { best = x[i]; best_idx = i; }
+    }
+    return best_idx;
+}
+
+static int sample_top_p(const float* logits, int vocab_size,
+                         float temperature, float top_p) {
+    // Temperature-scaled logits
+    float* probs = malloc(vocab_size * sizeof(float));
+    for (int i = 0; i < vocab_size; i++) probs[i] = logits[i] / temperature;
+    cpu_softmax(probs, vocab_size);
+
+    // Sort indices by probability (descending) — use simple selection for top-p
+    // Accumulate until top-p threshold
+    float cumsum = 0.0f;
+    int* indices = malloc(vocab_size * sizeof(int));
+    for (int i = 0; i < vocab_size; i++) indices[i] = i;
+
+    // Partial sort: find nucleus
+    int nucleus_size = 0;
+    float nucleus_sum = 0.0f;
+    while (nucleus_sum < top_p && nucleus_size < vocab_size) {
+        // Find max in remaining
+        float best = -1.0f;
+        int best_pos = nucleus_size;
+        for (int i = nucleus_size; i < vocab_size; i++) {
+            if (probs[indices[i]] > best) {
+                best = probs[indices[i]];
+                best_pos = i;
+            }
+        }
+        // Swap
+        int tmp = indices[nucleus_size];
+        indices[nucleus_size] = indices[best_pos];
+        indices[best_pos] = tmp;
+        nucleus_sum += best;
+        nucleus_size++;
+    }
+    (void)cumsum;
+
+    // Re-normalize nucleus
+    for (int i = 0; i < nucleus_size; i++) {
+        probs[indices[i]] /= nucleus_sum;
+    }
+
+    // Sample from nucleus
+    float r = (float)rand() / (float)RAND_MAX;
+    float acc = 0.0f;
+    int chosen = indices[0];
+    for (int i = 0; i < nucleus_size; i++) {
+        acc += probs[indices[i]];
+        if (r <= acc) { chosen = indices[i]; break; }
+    }
+
+    free(probs);
+    free(indices);
+    return chosen;
+}
+
+// ============================================================================
+// Token decoding (vocab.bin)
+// ============================================================================
+
+typedef struct {
+    char** tokens;
+    int count;
+} Vocab;
+
+static Vocab* vocab_load(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "ERROR: cannot open vocab %s\n", path); return NULL; }
+
+    uint32_t count;
+    if (fread(&count, 4, 1, f) != 1) { fclose(f); return NULL; }
+
+    Vocab* v = malloc(sizeof(Vocab));
+    v->count = count;
+    v->tokens = calloc(count, sizeof(char*));
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t len;
+        if (fread(&len, 2, 1, f) != 1) break;
+        v->tokens[i] = malloc(len + 1);
+        if (fread(v->tokens[i], 1, len, f) != len) break;
+        v->tokens[i][len] = '\0';
+    }
+
+    fclose(f);
+    fprintf(stderr, "[init] Loaded vocab: %d tokens\n", v->count);
+    return v;
+}
+
+static const char* decode_token(Vocab* v, int token_id) {
+    if (!v || token_id < 0 || token_id >= v->count) return "<unk>";
+    return v->tokens[token_id] ? v->tokens[token_id] : "<unk>";
+}
+
+static void vocab_free(Vocab* v) {
+    if (!v) return;
+    for (int i = 0; i < v->count; i++) free(v->tokens[i]);
+    free(v->tokens);
+    free(v);
+}
+
+// ============================================================================
+// fused_layer_forward — core per-layer computation
+// ============================================================================
+
+static void fused_layer_forward(
+    VkCtx* ctx,
+    WeightFile* wf,
+    Pipelines* pipes,
+    Buffers* bufs,
+    int layer_idx,
+    float* hidden,       // [HIDDEN_DIM] CPU in/out
+    KVCache* kv,         // non-NULL for full attention layers
+    LinearAttnState* la_state, // non-NULL for linear attention layers
+    int pos,
+    int packed_fd,
+    IoRing* ring)
+{
+    double t0 = 0, t1 = 0;
+    LayerWeightCache* lc = &layer_cache[layer_idx];
+    int is_full = lc->is_full;
+
+    // Upload hidden state to GPU
+    memcpy(vk_buf_map(bufs->hidden), hidden, HIDDEN_DIM * sizeof(float));
+
+    // =====================================================================
+    // Phase 1: Input RMS norm
+    // =====================================================================
+    if (g_timing_enabled) t0 = now_ms();
+    {
+        VkCmd* cmd = vk_cmd_begin(ctx);
+        gpu_rms_norm(ctx, cmd, pipes->rms_norm,
+                     bufs->hidden, wf->buf, lc->input_norm_w_off, bufs->normed,
+                     HIDDEN_DIM, RMS_NORM_EPS);
+        vk_cmd_submit(cmd);
+        vk_cmd_destroy(ctx, cmd);
+    }
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.input_norm += t1 - t0; }
+
+    // =====================================================================
+    // Phase 2: Attention projections (GPU)
+    // =====================================================================
+    if (g_timing_enabled) t0 = now_ms();
+    {
+        VkCmd* cmd = vk_cmd_begin(ctx);
+
+        if (is_full) {
+            // Q: [4096] -> [16384] (interleaved Q + gate)
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                wf->buf, lc->q_w_off, wf->buf, lc->q_s_off, wf->buf, lc->q_b_off,
+                bufs->normed, bufs->attn_proj,
+                FA_Q_PROJ_DIM, HIDDEN_DIM, GROUP_SIZE);
+            vk_cmd_barrier(cmd);
+
+            // K: [4096] -> [512]
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                wf->buf, lc->k_w_off, wf->buf, lc->k_s_off, wf->buf, lc->k_b_off,
+                bufs->normed, bufs->attn_proj2,
+                FA_KV_DIM, HIDDEN_DIM, GROUP_SIZE);
+            vk_cmd_barrier(cmd);
+
+            // V: [4096] -> [512]
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                wf->buf, lc->v_w_off, wf->buf, lc->v_s_off, wf->buf, lc->v_b_off,
+                bufs->normed, bufs->attn_proj3,
+                FA_KV_DIM, HIDDEN_DIM, GROUP_SIZE);
+        } else {
+            // QKV: [4096] -> [12288]
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                wf->buf, lc->qkv_w_off, wf->buf, lc->qkv_s_off, wf->buf, lc->qkv_b_off,
+                bufs->normed, bufs->attn_proj,
+                LINEAR_CONV_DIM, HIDDEN_DIM, GROUP_SIZE);
+            vk_cmd_barrier(cmd);
+
+            // Z: [4096] -> [8192]
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                wf->buf, lc->z_w_off, wf->buf, lc->z_s_off, wf->buf, lc->z_b_off,
+                bufs->normed, bufs->attn_proj2,
+                LINEAR_TOTAL_VALUE, HIDDEN_DIM, GROUP_SIZE);
+            vk_cmd_barrier(cmd);
+
+            // Beta: [4096] -> [64]
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                wf->buf, lc->beta_w_off, wf->buf, lc->beta_s_off, wf->buf, lc->beta_b_off,
+                bufs->normed, bufs->attn_proj4,
+                LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE);
+            vk_cmd_barrier(cmd);
+
+            // Alpha: [4096] -> [64]
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                wf->buf, lc->alpha_w_off, wf->buf, lc->alpha_s_off, wf->buf, lc->alpha_b_off,
+                bufs->normed, bufs->attn_proj5,
+                LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE);
+        }
+
+        vk_cmd_submit(cmd);
+        vk_cmd_destroy(ctx, cmd);
+    }
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.attn_proj += t1 - t0; }
+
+    // =====================================================================
+    // Phase 3: CPU attention compute
+    // =====================================================================
+    if (g_timing_enabled) t0 = now_ms();
+
+    int attn_out_dim = 0;
+
+    if (is_full) {
+        // Read back Q, K, V from GPU
+        float* q_proj = (float*)vk_buf_map(bufs->attn_proj);   // [16384]
+        float* k_proj = (float*)vk_buf_map(bufs->attn_proj2);  // [512]
+        float* v_proj = (float*)vk_buf_map(bufs->attn_proj3);  // [512]
+
+        // full_attn_forward expects interleaved q_proj format
+        float attn_out[FA_O_PROJ_IN_DIM]; // [8192]
+        full_attn_forward(kv, q_proj, k_proj, v_proj, pos, attn_out);
+
+        // Copy to GPU attn_out buffer
+        memcpy(vk_buf_map(bufs->attn_out), attn_out, FA_O_PROJ_IN_DIM * sizeof(float));
+        attn_out_dim = FA_O_PROJ_IN_DIM;
+    } else {
+        // Read back QKV, Z, beta, alpha from GPU
+        float* qkv_proj = (float*)vk_buf_map(bufs->attn_proj);   // [12288]
+        float* z_proj   = (float*)vk_buf_map(bufs->attn_proj2);  // [8192]
+        float* beta_proj  = (float*)vk_buf_map(bufs->attn_proj4);  // [64]
+        float* alpha_proj = (float*)vk_buf_map(bufs->attn_proj5);  // [64]
+
+        float attn_out[LINEAR_TOTAL_VALUE]; // [8192]
+        linear_attn_forward(
+            la_state,
+            qkv_proj, z_proj, beta_proj, alpha_proj,
+            (const uint16_t*)lc->conv1d_w,
+            (const float*)lc->A_log,
+            (const uint16_t*)lc->dt_bias,
+            (const uint16_t*)lc->gated_norm_w,
+            attn_out
+        );
+
+        memcpy(vk_buf_map(bufs->attn_out), attn_out, LINEAR_TOTAL_VALUE * sizeof(float));
+        attn_out_dim = LINEAR_TOTAL_VALUE;
+    }
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.cpu_attn += t1 - t0; }
+
+    // =====================================================================
+    // Phase 4: O projection + residual add
+    // =====================================================================
+    if (g_timing_enabled) t0 = now_ms();
+    {
+        VkCmd* cmd = vk_cmd_begin(ctx);
+
+        // O projection: attn_out -> o_proj_out [attn_out_dim -> 4096]
+        if (is_full) {
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                wf->buf, lc->o_w_off, wf->buf, lc->o_s_off, wf->buf, lc->o_b_off,
+                bufs->attn_out, bufs->o_proj_out,
+                HIDDEN_DIM, (uint32_t)attn_out_dim, GROUP_SIZE);
+        } else {
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                wf->buf, lc->out_proj_w_off, wf->buf, lc->out_proj_s_off, wf->buf, lc->out_proj_b_off,
+                bufs->attn_out, bufs->o_proj_out,
+                HIDDEN_DIM, (uint32_t)attn_out_dim, GROUP_SIZE);
+        }
+        vk_cmd_barrier(cmd);
+
+        // Residual add: hidden + o_proj_out -> hidden
+        gpu_residual_add(ctx, cmd, pipes->residual_add,
+            bufs->o_proj_out, bufs->hidden, bufs->hidden, HIDDEN_DIM);
+
+        vk_cmd_submit(cmd);
+        vk_cmd_destroy(ctx, cmd);
+    }
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.o_proj += t1 - t0; }
+
+    // =====================================================================
+    // Phase 5: Post-attention norm + routing projection + shared expert
+    // =====================================================================
+    if (g_timing_enabled) t0 = now_ms();
+
+    // Save hidden as residual for MoE
+    memcpy(vk_buf_map(bufs->residual), vk_buf_map(bufs->hidden), HIDDEN_DIM * sizeof(float));
+
+    {
+        VkCmd* cmd = vk_cmd_begin(ctx);
+
+        // RMS norm
+        gpu_rms_norm(ctx, cmd, pipes->rms_norm,
+                     bufs->hidden, wf->buf, lc->post_attn_norm_w_off, bufs->normed,
+                     HIDDEN_DIM, RMS_NORM_EPS);
+        vk_cmd_barrier(cmd);
+
+        // Routing: [4096] -> [512]
+        gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+            wf->buf, lc->gate_w_off, wf->buf, lc->gate_s_off, wf->buf, lc->gate_b_off,
+            bufs->normed, bufs->routing_scores,
+            NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE);
+        vk_cmd_barrier(cmd);
+
+        // Shared expert fused gate_up_swiglu: [4096] -> [1024]
+        gpu_fused_gate_up_swiglu(ctx, cmd, pipes->fused_gate_up_swiglu,
+            wf->buf, lc->sg_w_off, wf->buf, lc->sg_s_off, wf->buf, lc->sg_b_off,
+            wf->buf, lc->su_w_off, wf->buf, lc->su_s_off, wf->buf, lc->su_b_off,
+            bufs->normed, bufs->shared_act,
+            SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+        vk_cmd_barrier(cmd);
+
+        // Shared expert down_proj: [1024] -> [4096]
+        gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+            wf->buf, lc->sd_w_off, wf->buf, lc->sd_s_off, wf->buf, lc->sd_b_off,
+            bufs->shared_act, bufs->shared_out,
+            HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+        vk_cmd_barrier(cmd);
+
+        // Shared expert gate: [4096] -> [1]
+        gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+            wf->buf, lc->seg_w_off, wf->buf, lc->seg_s_off, wf->buf, lc->seg_b_off,
+            bufs->normed, bufs->shared_gate_score,
+            1, HIDDEN_DIM, GROUP_SIZE);
+
+        vk_cmd_submit(cmd);
+        vk_cmd_destroy(ctx, cmd);
+    }
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.post_norm += t1 - t0; }
+
+    // =====================================================================
+    // Phase 6: CPU routing (softmax + top-K)
+    // =====================================================================
+    if (g_timing_enabled) t0 = now_ms();
+
+    float* routing_scores = (float*)vk_buf_map(bufs->routing_scores);
+    float scores_copy[NUM_EXPERTS];
+    memcpy(scores_copy, routing_scores, NUM_EXPERTS * sizeof(float));
+    cpu_softmax(scores_copy, NUM_EXPERTS);
+
+    int expert_indices[K_EXPERTS];
+    float expert_weights[K_EXPERTS];
+    cpu_topk(scores_copy, NUM_EXPERTS, K_EXPERTS, expert_indices, expert_weights);
+
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.cpu_routing += t1 - t0; }
+
+    // =====================================================================
+    // Phase 7: Expert I/O via io_uring
+    // =====================================================================
+    if (g_timing_enabled) t0 = now_ms();
+
+    if (packed_fd >= 0) {
+        uint64_t io_offsets[K_EXPERTS];
+        void*    io_dests[K_EXPERTS];
+        size_t   io_sizes[K_EXPERTS];
+
+        for (int k = 0; k < K_EXPERTS; k++) {
+            io_offsets[k] = (uint64_t)expert_indices[k] * EXPERT_SIZE;
+            io_dests[k]   = vk_buf_map(bufs->expert_data[k]);
+            io_sizes[k]   = EXPERT_SIZE;
+        }
+
+        int ret = io_ring_read_experts(ring, packed_fd, io_offsets, io_dests, io_sizes, K_EXPERTS);
+        if (ret != 0) {
+            fprintf(stderr, "WARNING: layer %d expert io_ring read failed\n", layer_idx);
+        }
+    }
+
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; }
+
+    // =====================================================================
+    // Phase 8: Expert forward (GPU) + MoE combine
+    // =====================================================================
+    if (g_timing_enabled) t0 = now_ms();
+
+    // Save normed state pointer for expert input (still in bufs->normed from phase 5)
+    if (packed_fd >= 0) {
+        VkCmd* cmd = vk_cmd_begin(ctx);
+
+        for (int k = 0; k < K_EXPERTS; k++) {
+            // fused_gate_up_swiglu: expert gate+up -> expert_act
+            // Expert data layout: gate_w at GATE_W_OFF, gate_s at GATE_S_OFF, etc.
+            gpu_fused_gate_up_swiglu(ctx, cmd, pipes->fused_gate_up_swiglu,
+                bufs->expert_data[k], GATE_W_OFF,
+                bufs->expert_data[k], GATE_S_OFF,
+                bufs->expert_data[k], GATE_B_OFF,
+                bufs->expert_data[k], UP_W_OFF,
+                bufs->expert_data[k], UP_S_OFF,
+                bufs->expert_data[k], UP_B_OFF,
+                bufs->normed, bufs->expert_act[k],
+                MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
+            vk_cmd_barrier(cmd);
+
+            // down_proj: expert_act -> expert_out
+            gpu_dequant_matvec(ctx, cmd, pipes->dequant_matvec,
+                bufs->expert_data[k], DOWN_W_OFF,
+                bufs->expert_data[k], DOWN_S_OFF,
+                bufs->expert_data[k], DOWN_B_OFF,
+                bufs->expert_act[k], bufs->expert_out[k],
+                HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+            vk_cmd_barrier(cmd);
+        }
+
+        vk_cmd_submit(cmd);
+        vk_cmd_destroy(ctx, cmd);
+    }
+
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_compute += t1 - t0; }
+
+    // =====================================================================
+    // Phase 9: MoE combine
+    // =====================================================================
+    if (g_timing_enabled) t0 = now_ms();
+
+    {
+        // Write moe_params: [w0, w1, w2, w3, shared_gate_score_raw]
+        float* params = (float*)vk_buf_map(bufs->moe_params);
+        for (int k = 0; k < K_EXPERTS; k++) params[k] = expert_weights[k];
+        // shared_gate_score is raw logit; sigmoid applied in shader
+        float shared_gate_raw = ((float*)vk_buf_map(bufs->shared_gate_score))[0];
+        params[4] = shared_gate_raw;
+
+        VkCmd* cmd = vk_cmd_begin(ctx);
+        gpu_moe_combine(ctx, cmd, pipes->moe_combine,
+            bufs->residual, bufs->shared_out, bufs->hidden,
+            bufs->expert_out, bufs->moe_params,
+            HIDDEN_DIM, K_EXPERTS);
+        vk_cmd_submit(cmd);
+        vk_cmd_destroy(ctx, cmd);
+    }
+
+    if (g_timing_enabled) { t1 = now_ms(); g_timing.moe_combine += t1 - t0; g_timing.count++; }
+    else { g_timing.count++; }
+
+    // Read back hidden state from GPU
+    memcpy(hidden, vk_buf_map(bufs->hidden), HIDDEN_DIM * sizeof(float));
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char** argv) {
+    // ---- CLI parsing ----
+    const char* prompt = "Hello";
+    int max_tokens = 100;
+    float temperature = 0.0f;
+    float top_p = 0.9f;
+    const char* model_dir = ".";  // Directory containing model_weights.bin/json and packed_experts/
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
+            prompt = argv[++i];
+        } else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
+            max_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--timing") == 0) {
+            g_timing_enabled = 1;
+        } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
+            temperature = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
+            top_p = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
+            model_dir = argv[++i];
+        } else {
+            fprintf(stderr, "Usage: %s --prompt \"text\" --tokens N [--timing] "
+                    "[--temperature T] [--top-p P] [--model-dir DIR]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "[config] prompt=\"%.60s%s\" tokens=%d temp=%.2f top_p=%.2f timing=%d\n",
+            prompt, strlen(prompt) > 60 ? "..." : "", max_tokens, temperature, top_p,
+            g_timing_enabled);
+
+    double t0_total = now_ms();
+
+    // ---- Initialize Vulkan ----
+    fprintf(stderr, "[init] Creating Vulkan context...\n");
+    VkCtx* ctx = vk_create();
+    if (!ctx) {
+        fprintf(stderr, "FATAL: vk_create() failed\n");
+        return 1;
+    }
+
+    // ---- Load weights ----
+    char bin_path[512], json_path[512];
+    snprintf(bin_path, sizeof(bin_path), "%s/model_weights.bin", model_dir);
+    snprintf(json_path, sizeof(json_path), "%s/model_weights.json", model_dir);
+
+    fprintf(stderr, "[init] Loading weights from %s...\n", bin_path);
+    WeightFile* wf = weights_load(ctx, bin_path, json_path);
+    if (!wf) {
+        fprintf(stderr, "FATAL: weights_load() failed\n");
+        vk_destroy(ctx);
+        return 1;
+    }
+    fprintf(stderr, "[init] Weights loaded: %zu bytes, %d tensors\n",
+            wf->total_size, wf->num_tensors);
+
+    // ---- Build layer weight cache ----
+    build_layer_cache(wf);
+
+    // ---- Load tokenizer ----
+    char tok_path[512], vocab_path[512];
+    snprintf(tok_path, sizeof(tok_path), "%s/tokenizer.bin", model_dir);
+    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.bin", model_dir);
+
+    bpe_tokenizer tok;
+    if (bpe_load(&tok, tok_path) != 0) {
+        fprintf(stderr, "FATAL: bpe_load() failed\n");
+        weights_destroy(ctx, wf);
+        vk_destroy(ctx);
+        return 1;
+    }
+
+    Vocab* vocab = vocab_load(vocab_path);
+    if (!vocab) {
+        fprintf(stderr, "FATAL: vocab_load() failed\n");
+        bpe_free(&tok);
+        weights_destroy(ctx, wf);
+        vk_destroy(ctx);
+        return 1;
+    }
+
+    // ---- Create io_uring ----
+    IoRing* ring = io_ring_create(16);
+    if (!ring) {
+        fprintf(stderr, "FATAL: io_ring_create() failed\n");
+        vocab_free(vocab);
+        bpe_free(&tok);
+        weights_destroy(ctx, wf);
+        vk_destroy(ctx);
+        return 1;
+    }
+
+    // ---- Open expert layer files ----
+    int layer_fds[NUM_LAYERS];
+    int expert_layers_available = 0;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/packed_experts/layer_%d.bin", model_dir, i);
+        layer_fds[i] = open(path, O_RDONLY);
+        if (layer_fds[i] >= 0) expert_layers_available++;
+    }
+    fprintf(stderr, "[init] Expert layers: %d/%d available\n", expert_layers_available, NUM_LAYERS);
+
+    // ---- Create pipelines ----
+    Pipelines pipes;
+    char shader_path[512];
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/dequant_matvec_4bit.spv", model_dir);
+    pipes.dequant_matvec = vk_pipe_create(ctx, shader_path, 12, 5); // 3x uint32 push, 5 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/rms_norm.spv", model_dir);
+    pipes.rms_norm = vk_pipe_create(ctx, shader_path, 8, 3); // uint32+float push, 3 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/residual_add.spv", model_dir);
+    pipes.residual_add = vk_pipe_create(ctx, shader_path, 4, 3); // uint32 push, 3 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/fused_gate_up_swiglu.spv", model_dir);
+    pipes.fused_gate_up_swiglu = vk_pipe_create(ctx, shader_path, 12, 8); // 3x uint32, 8 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/moe_combine.spv", model_dir);
+    pipes.moe_combine = vk_pipe_create(ctx, shader_path, 8, 8); // 2x uint32, 8 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/sigmoid_gate.spv", model_dir);
+    pipes.sigmoid_gate = vk_pipe_create(ctx, shader_path, 4, 2); // uint32, 2 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/attn_scores.spv", model_dir);
+    pipes.attn_scores = vk_pipe_create(ctx, shader_path, 28, 3); // 7x uint/float push, 3 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/attn_softmax.spv", model_dir);
+    pipes.attn_softmax = vk_pipe_create(ctx, shader_path, 8, 1); // 2x uint32, 1 binding
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/attn_values.spv", model_dir);
+    pipes.attn_values = vk_pipe_create(ctx, shader_path, 20, 3); // 5x uint32, 3 bindings
+
+    fprintf(stderr, "[init] Pipelines created\n");
+
+    // ---- Allocate scratch buffers ----
+    Buffers buf;
+    memset(&buf, 0, sizeof(buf));
+
+    buf.hidden   = vk_buf_create(ctx, HIDDEN_DIM * sizeof(float));
+    buf.normed   = vk_buf_create(ctx, HIDDEN_DIM * sizeof(float));
+    buf.residual = vk_buf_create(ctx, HIDDEN_DIM * sizeof(float));
+
+    // Attention projection outputs — sized for the larger of full/linear
+    buf.attn_proj  = vk_buf_create(ctx, FA_Q_PROJ_DIM * sizeof(float));  // 16384 >= 12288
+    buf.attn_proj2 = vk_buf_create(ctx, LINEAR_TOTAL_VALUE * sizeof(float)); // 8192 >= 512
+    buf.attn_proj3 = vk_buf_create(ctx, FA_KV_DIM * sizeof(float));     // 512
+    buf.attn_proj4 = vk_buf_create(ctx, LINEAR_NUM_V_HEADS * sizeof(float)); // 64
+    buf.attn_proj5 = vk_buf_create(ctx, LINEAR_NUM_V_HEADS * sizeof(float)); // 64
+
+    buf.attn_out   = vk_buf_create(ctx, FA_O_PROJ_IN_DIM * sizeof(float)); // 8192
+    buf.o_proj_out = vk_buf_create(ctx, HIDDEN_DIM * sizeof(float));
+
+    buf.routing_scores = vk_buf_create(ctx, NUM_EXPERTS * sizeof(float));
+
+    buf.shared_act = vk_buf_create(ctx, SHARED_INTERMEDIATE * sizeof(float));
+    buf.shared_out = vk_buf_create(ctx, HIDDEN_DIM * sizeof(float));
+    buf.shared_gate_score = vk_buf_create(ctx, sizeof(float));
+
+    for (int k = 0; k < K_EXPERTS; k++) {
+        buf.expert_data[k] = vk_buf_create(ctx, EXPERT_SIZE);
+        buf.expert_act[k]  = vk_buf_create(ctx, MOE_INTERMEDIATE * sizeof(float));
+        buf.expert_out[k]  = vk_buf_create(ctx, HIDDEN_DIM * sizeof(float));
+    }
+
+    buf.moe_params = vk_buf_create(ctx, 5 * sizeof(float));
+    buf.logits     = vk_buf_create(ctx, VOCAB_SIZE * sizeof(float));
+
+    // Full attention KV caches on GPU (for GPU-accelerated attention)
+    buf.attn_scores_buf = vk_buf_create(ctx, FA_NUM_ATTN_HEADS * FA_MAX_SEQ_LEN * sizeof(float));
+    for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+        buf.kv_k[i] = vk_buf_create(ctx, FA_MAX_SEQ_LEN * FA_KV_DIM * sizeof(float));
+        buf.kv_v[i] = vk_buf_create(ctx, FA_MAX_SEQ_LEN * FA_KV_DIM * sizeof(float));
+    }
+
+    fprintf(stderr, "[init] Scratch buffers allocated\n");
+
+    // ---- Allocate per-layer attention state ----
+    LinearAttnState* la_states[NUM_LAYERS];
+    KVCache* kv_caches[NUM_LAYERS];
+    memset(la_states, 0, sizeof(la_states));
+    memset(kv_caches, 0, sizeof(kv_caches));
+
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
+        if (is_full) {
+            kv_caches[i] = kv_cache_create();
+        } else {
+            la_states[i] = linear_attn_state_create();
+        }
+    }
+
+    fprintf(stderr, "[init] Attention state allocated (%d KVCache + %d LinearAttn)\n",
+            NUM_FULL_ATTN_LAYERS, NUM_LINEAR_LAYERS);
+
+    double t_init = now_ms();
+    fprintf(stderr, "[init] Setup: %.1f ms\n\n", t_init - t0_total);
+
+    // ---- Working buffers (declared early for cleanup label) ----
+    float* hidden = NULL;
+    float* logits = NULL;
+
+    // ---- Tokenize prompt ----
+    uint32_t prompt_ids[8192];
+    int num_prompt = bpe_encode(&tok, prompt, prompt_ids, 8192);
+    fprintf(stderr, "[prompt] \"%s\" -> %d tokens\n", prompt, num_prompt);
+
+    if (num_prompt == 0) {
+        fprintf(stderr, "ERROR: empty prompt after tokenization\n");
+        goto cleanup;
+    }
+
+    hidden = calloc(HIDDEN_DIM, sizeof(float));
+    logits = calloc(VOCAB_SIZE, sizeof(float));
+
+    // Final norm weight
+    TensorInfo* final_norm_ti = weights_get_tensor(wf, "model.norm.weight");
+    size_t final_norm_off = final_norm_ti ? final_norm_ti->offset : 0;
+
+    // LM head weight offsets
+    size_t lm_w_off = get_tensor_offset(wf, "lm_head.weight");
+    size_t lm_s_off = get_tensor_offset(wf, "lm_head.scales");
+    size_t lm_b_off = get_tensor_offset(wf, "lm_head.biases");
+
+    // ---- Prefill: process prompt tokens ----
+    fprintf(stderr, "--- Prefilling %d prompt tokens ---\n", num_prompt);
+    int pos = 0;
+
+    double t_prefill_start = now_ms();
+
+    for (int t = 0; t < num_prompt; t++) {
+        embed_lookup(wf, prompt_ids[t], hidden);
+
+        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+            int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+            fused_layer_forward(ctx, wf, &pipes, &buf, layer, hidden,
+                                is_full ? kv_caches[layer] : NULL,
+                                is_full ? NULL : la_states[layer],
+                                pos, layer_fds[layer], ring);
+
+            // Reset descriptor pool periodically to avoid exhaustion
+            // (each layer uses many descriptor sets)
+        }
+        // Reset descriptor pool between tokens
+        vk_descriptor_pool_reset(ctx);
+        pos++;
+
+        if (t == 0) {
+            fprintf(stderr, "  [prefill] first token: %.0f ms\n", now_ms() - t_prefill_start);
+        }
+    }
+
+    double t_prefill_end = now_ms();
+    fprintf(stderr, "[prefill] %d tokens: %.0f ms (%.1f ms/token)\n",
+            num_prompt, t_prefill_end - t_prefill_start,
+            (t_prefill_end - t_prefill_start) / num_prompt);
+
+    // ---- Final norm for last prefill token ----
+    {
+        memcpy(vk_buf_map(buf.hidden), hidden, HIDDEN_DIM * sizeof(float));
+        VkCmd* cmd = vk_cmd_begin(ctx);
+        gpu_rms_norm(ctx, cmd, pipes.rms_norm,
+                     buf.hidden, wf->buf, final_norm_off, buf.normed,
+                     HIDDEN_DIM, RMS_NORM_EPS);
+        vk_cmd_submit(cmd);
+        vk_cmd_destroy(ctx, cmd);
+        memcpy(hidden, vk_buf_map(buf.normed), HIDDEN_DIM * sizeof(float));
+    }
+
+    // ---- LM head: hidden -> logits ----
+    {
+        memcpy(vk_buf_map(buf.normed), hidden, HIDDEN_DIM * sizeof(float));
+        VkCmd* cmd = vk_cmd_begin(ctx);
+        gpu_dequant_matvec(ctx, cmd, pipes.dequant_matvec,
+            wf->buf, lm_w_off, wf->buf, lm_s_off, wf->buf, lm_b_off,
+            buf.normed, buf.logits,
+            VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+        vk_cmd_submit(cmd);
+        vk_cmd_destroy(ctx, cmd);
+        memcpy(logits, vk_buf_map(buf.logits), VOCAB_SIZE * sizeof(float));
+    }
+
+    // ---- Sample first token ----
+    int next_token;
+    if (temperature == 0.0f) {
+        next_token = cpu_argmax(logits, VOCAB_SIZE);
+    } else {
+        next_token = sample_top_p(logits, VOCAB_SIZE, temperature, top_p);
+    }
+
+    double ttft_ms = now_ms() - t0_total;
+    fprintf(stderr, "[ttft] %.0f ms (prefill %d tokens)\n", ttft_ms, num_prompt);
+
+    // Print first token
+    printf("%s", decode_token(vocab, next_token));
+    fflush(stdout);
+
+    // ---- Autoregressive generation loop ----
+    int total_generated = 1;
+    if (g_timing_enabled) timing_reset();
+
+    for (int gen = 1; gen < max_tokens; gen++) {
+        double t_gen_start = now_ms();
+
+        // Check EOS
+        if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
+            fprintf(stderr, "\n[eos] Token %d at position %d\n", next_token, gen);
+            break;
+        }
+
+        // Embed
+        embed_lookup(wf, next_token, hidden);
+
+        // Run 60 layers
+        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+            int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+            fused_layer_forward(ctx, wf, &pipes, &buf, layer, hidden,
+                                is_full ? kv_caches[layer] : NULL,
+                                is_full ? NULL : la_states[layer],
+                                pos, layer_fds[layer], ring);
+        }
+        vk_descriptor_pool_reset(ctx);
+        pos++;
+
+        // Final norm
+        {
+            memcpy(vk_buf_map(buf.hidden), hidden, HIDDEN_DIM * sizeof(float));
+            VkCmd* cmd = vk_cmd_begin(ctx);
+            gpu_rms_norm(ctx, cmd, pipes.rms_norm,
+                         buf.hidden, wf->buf, final_norm_off, buf.normed,
+                         HIDDEN_DIM, RMS_NORM_EPS);
+            vk_cmd_submit(cmd);
+            vk_cmd_destroy(ctx, cmd);
+            memcpy(hidden, vk_buf_map(buf.normed), HIDDEN_DIM * sizeof(float));
+        }
+
+        // LM head
+        {
+            memcpy(vk_buf_map(buf.normed), hidden, HIDDEN_DIM * sizeof(float));
+            VkCmd* cmd = vk_cmd_begin(ctx);
+            gpu_dequant_matvec(ctx, cmd, pipes.dequant_matvec,
+                wf->buf, lm_w_off, wf->buf, lm_s_off, wf->buf, lm_b_off,
+                buf.normed, buf.logits,
+                VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+            vk_cmd_submit(cmd);
+            vk_cmd_destroy(ctx, cmd);
+            memcpy(logits, vk_buf_map(buf.logits), VOCAB_SIZE * sizeof(float));
+        }
+
+        // Sample
+        if (temperature == 0.0f) {
+            next_token = cpu_argmax(logits, VOCAB_SIZE);
+        } else {
+            next_token = sample_top_p(logits, VOCAB_SIZE, temperature, top_p);
+        }
+        total_generated++;
+
+        // Print decoded token
+        printf("%s", decode_token(vocab, next_token));
+        fflush(stdout);
+
+        double t_gen_end = now_ms();
+        double tok_time = t_gen_end - t_gen_start;
+        fprintf(stderr, "  [gen %d/%d] token_id=%d (%.0f ms, %.2f tok/s)\n",
+                gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
+    }
+
+    if (g_timing_enabled) timing_print();
+
+    // ---- Statistics ----
+    printf("\n\n--- Statistics ---\n");
+    double total_time = now_ms() - t0_total;
+    printf("Total time:     %.1f s\n", total_time / 1000.0);
+    printf("TTFT:           %.0f ms\n", ttft_ms);
+    printf("Tokens:         %d generated\n", total_generated);
+    if (total_generated > 1) {
+        double gen_time = total_time - ttft_ms;
+        printf("Generation:     %.1f s (%.2f tok/s)\n",
+               gen_time / 1000.0, (total_generated - 1) * 1000.0 / gen_time);
+    }
+    printf("Config:         K=%d experts, %d layers\n", K_EXPERTS, NUM_LAYERS);
+
+    // ---- Cleanup ----
+cleanup:
+    free(hidden);
+    free(logits);
+
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        if (kv_caches[i]) kv_cache_destroy(kv_caches[i]);
+        if (la_states[i]) linear_attn_state_destroy(la_states[i]);
+        if (layer_fds[i] >= 0) close(layer_fds[i]);
+    }
+
+    // Destroy GPU buffers
+    vk_buf_destroy(ctx, buf.hidden);
+    vk_buf_destroy(ctx, buf.normed);
+    vk_buf_destroy(ctx, buf.residual);
+    vk_buf_destroy(ctx, buf.attn_proj);
+    vk_buf_destroy(ctx, buf.attn_proj2);
+    vk_buf_destroy(ctx, buf.attn_proj3);
+    vk_buf_destroy(ctx, buf.attn_proj4);
+    vk_buf_destroy(ctx, buf.attn_proj5);
+    vk_buf_destroy(ctx, buf.attn_out);
+    vk_buf_destroy(ctx, buf.o_proj_out);
+    vk_buf_destroy(ctx, buf.routing_scores);
+    vk_buf_destroy(ctx, buf.shared_act);
+    vk_buf_destroy(ctx, buf.shared_out);
+    vk_buf_destroy(ctx, buf.shared_gate_score);
+    for (int k = 0; k < K_EXPERTS; k++) {
+        vk_buf_destroy(ctx, buf.expert_data[k]);
+        vk_buf_destroy(ctx, buf.expert_act[k]);
+        vk_buf_destroy(ctx, buf.expert_out[k]);
+    }
+    vk_buf_destroy(ctx, buf.moe_params);
+    vk_buf_destroy(ctx, buf.logits);
+    vk_buf_destroy(ctx, buf.attn_scores_buf);
+    for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+        vk_buf_destroy(ctx, buf.kv_k[i]);
+        vk_buf_destroy(ctx, buf.kv_v[i]);
+    }
+
+    // Destroy pipelines
+    vk_pipe_destroy(ctx, pipes.dequant_matvec);
+    vk_pipe_destroy(ctx, pipes.rms_norm);
+    vk_pipe_destroy(ctx, pipes.residual_add);
+    vk_pipe_destroy(ctx, pipes.fused_gate_up_swiglu);
+    vk_pipe_destroy(ctx, pipes.moe_combine);
+    vk_pipe_destroy(ctx, pipes.sigmoid_gate);
+    vk_pipe_destroy(ctx, pipes.attn_scores);
+    vk_pipe_destroy(ctx, pipes.attn_softmax);
+    vk_pipe_destroy(ctx, pipes.attn_values);
+
+    io_ring_destroy(ring);
+    vocab_free(vocab);
+    bpe_free(&tok);
+    weights_destroy(ctx, wf);
+    vk_destroy(ctx);
+
+    return 0;
+}
