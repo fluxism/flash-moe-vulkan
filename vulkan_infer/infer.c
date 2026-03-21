@@ -20,7 +20,7 @@
 #include <float.h>
 
 // Debug helpers
-static int g_debug = 0;
+int g_debug = 0;
 static float vec_rms(const float* v, int n) {
     float sq = 0; for (int i = 0; i < n; i++) sq += v[i]*v[i];
     return sqrtf(sq / n);
@@ -491,8 +491,9 @@ static void gpu_dequant_matvec(VkCtx* ctx __attribute__((unused)), VkCmd* cmd, V
     // At subgroup_size=64: rows_per_tg=4, need out_dim/4 workgroups.
     // Since we don't know subgroup size, dispatch ceil(out_dim/1) = out_dim workgroups
     // and let excess early-exit via the `if (row >= out_dim) return;` guard.
-    // This is safe but might over-dispatch. For correctness, use out_dim.
-    uint32_t wg = (out_dim + 7) / 8; // assume subgroup_size=32 -> 8 rows/wg
+    // Dispatch conservatively: assume rows_per_tg = 4 (wave64).
+    // Excess workgroups early-exit via `if (row >= out_dim) return;` in shader.
+    uint32_t wg = (out_dim + 3) / 4;
     vk_cmd_dispatch(cmd, wg, 1, 1);
 }
 
@@ -552,7 +553,7 @@ static void gpu_fused_gate_up_swiglu(VkCtx* ctx __attribute__((unused)), VkCmd* 
     };
 
     vk_cmd_bind(cmd, pipe, bufs, offsets, ranges, 8, &pc, sizeof(pc));
-    uint32_t wg = (out_dim + 7) / 8;
+    uint32_t wg = (out_dim + 3) / 4; // wave64: 4 rows per workgroup
     vk_cmd_dispatch(cmd, wg, 1, 1);
 }
 
@@ -918,10 +919,14 @@ static void fused_layer_forward(
     }
     if (g_timing_enabled) { t1 = now_ms(); g_timing.o_proj += t1 - t0; }
 
-    if (g_debug && layer_idx < 2) {
+    if (g_debug && layer_idx == 0) {
+        float* op = (float*)vk_buf_map(bufs->o_proj_out);
+        fprintf(stderr, "[DBG] L0 o_proj_out: rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                vec_rms(op, HIDDEN_DIM), op[0], op[1], op[2], op[3], op[4]);
         float* h = (float*)vk_buf_map(bufs->hidden);
-        fprintf(stderr, "[DBG] L%d after residual+o_proj: rms=%.6f first3=[%.6f,%.6f,%.6f]\n",
-                layer_idx, vec_rms(h, HIDDEN_DIM), h[0], h[1], h[2]);
+        fprintf(stderr, "[DBG] L0 after residual+o_proj: rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                vec_rms(h, HIDDEN_DIM), h[0], h[1], h[2], h[3], h[4]);
+        // Python ref: o_proj rms=0.024178, residual rms=0.028731
     }
 
     // =====================================================================

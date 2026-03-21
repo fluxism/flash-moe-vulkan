@@ -2,8 +2,11 @@
 
 #include <cblas.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+extern int g_debug;
 
 // ============================================================================
 // Helpers
@@ -131,7 +134,6 @@ void linear_attn_forward(
     const int k_heads_per_v = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS; // 4
 
     // ---- Conv1d step ----
-    // conv1d_step does the convolution + SiLU + state shift in one call
     float conv_out[LINEAR_CONV_DIM];
     conv1d_step(state->conv_state, qkv_proj, conv_weights, conv_out, LINEAR_CONV_DIM);
 
@@ -139,6 +141,24 @@ void linear_attn_forward(
     float* lin_q = conv_out;                             // [2048]
     float* lin_k = conv_out + LINEAR_TOTAL_KEY;          // [2048]
     float* lin_v = conv_out + 2 * LINEAR_TOTAL_KEY;      // [8192]
+
+    if (g_debug) {
+        // Count non-zero elements and check where divergence starts
+        int nonzero = 0;
+        float sq = 0;
+        int first_wrong = -1;
+        for (int i = 0; i < LINEAR_CONV_DIM; i++) {
+            sq += conv_out[i]*conv_out[i];
+            if (conv_out[i] != 0.0f) nonzero++;
+        }
+        fprintf(stderr, "[LA] conv_out rms=%.6f nonzero=%d/%d\n",
+                sqrtf(sq/LINEAR_CONV_DIM), nonzero, LINEAR_CONV_DIM);
+        fprintf(stderr, "[LA] conv_out[6000..6004]=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                conv_out[6000], conv_out[6001], conv_out[6002], conv_out[6003], conv_out[6004]);
+        fprintf(stderr, "[LA] conv_out[10000..10004]=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                conv_out[10000], conv_out[10001], conv_out[10002], conv_out[10003], conv_out[10004]);
+        g_debug = 0;
+    }
 
     // ---- RMS normalize q and k per k-head, apply scaling ----
     // inv_scale = 1/sqrt(key_dim) = 1/sqrt(128)
