@@ -20,7 +20,9 @@ float bf16_to_f32(uint raw_pair, uint which) {
     return uintBitsToFloat(bf16 << 16u);
 }
 
-shared float x_shared[4096];
+// Max in_dim across all projections:
+// QKV=4096, Z=4096, O=8192, lm_head=4096, routing=4096, experts=4096/1024
+shared float x_shared[8192];
 
 void main() {
     uint lid = gl_LocalInvocationID.x;

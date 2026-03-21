@@ -157,7 +157,7 @@ void linear_attn_forward(
                 conv_out[6000], conv_out[6001], conv_out[6002], conv_out[6003], conv_out[6004]);
         fprintf(stderr, "[LA] conv_out[10000..10004]=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
                 conv_out[10000], conv_out[10001], conv_out[10002], conv_out[10003], conv_out[10004]);
-        g_debug = 0;
+        // Don't reset g_debug — keep printing for other stages
     }
 
     // ---- RMS normalize q and k per k-head, apply scaling ----
@@ -237,8 +237,14 @@ void linear_attn_forward(
                     0.0f, o_h, 1);
     }
 
+    if (g_debug) {
+        float sq = 0;
+        for (int i = 0; i < LINEAR_TOTAL_VALUE; i++) sq += output[i]*output[i];
+        fprintf(stderr, "[LA] delta_net_out rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                sqrtf(sq/LINEAR_TOTAL_VALUE), output[0], output[1], output[2], output[3], output[4]);
+    }
+
     // ---- Gated RMS norm per v-head ----
-    // Temporary buffer for pre-norm values (output is overwritten in-place)
     float pre_norm[LINEAR_TOTAL_VALUE];
     memcpy(pre_norm, output, LINEAR_TOTAL_VALUE * sizeof(float));
 
@@ -247,5 +253,12 @@ void linear_attn_forward(
         float* zh = (float*)z_proj + vh * LINEAR_VALUE_DIM;
         float* gh = output + vh * LINEAR_VALUE_DIM;
         rms_norm_gated(oh, zh, gated_norm_w, gh, LINEAR_VALUE_DIM, RMS_EPS);
+    }
+
+    if (g_debug) {
+        float sq = 0;
+        for (int i = 0; i < LINEAR_TOTAL_VALUE; i++) sq += output[i]*output[i];
+        fprintf(stderr, "[LA] gated_rms_out rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                sqrtf(sq/LINEAR_TOTAL_VALUE), output[0], output[1], output[2], output[3], output[4]);
     }
 }

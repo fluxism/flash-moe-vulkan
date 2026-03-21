@@ -923,6 +923,29 @@ static void fused_layer_forward(
         float* op = (float*)vk_buf_map(bufs->o_proj_out);
         fprintf(stderr, "[DBG] L0 o_proj_out: rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
                 vec_rms(op, HIDDEN_DIM), op[0], op[1], op[2], op[3], op[4]);
+
+        // CPU reference o_proj for first 3 rows
+        float* attn_in = (float*)vk_buf_map(bufs->attn_out);
+        uint32_t* oW = (uint32_t*)((char*)wf->mapped + lc->out_proj_w_off);
+        uint16_t* oS = (uint16_t*)((char*)wf->mapped + lc->out_proj_s_off);
+        uint16_t* oB = (uint16_t*)((char*)wf->mapped + lc->out_proj_b_off);
+        int o_packed = attn_out_dim / 8;
+        int o_ngroups = attn_out_dim / GROUP_SIZE;
+        for (int row = 0; row < 3; row++) {
+            float acc = 0;
+            for (int g2 = 0; g2 < o_ngroups; g2++) {
+                float sc = bf16_to_f32(oS[row*o_ngroups+g2]);
+                float bi = bf16_to_f32(oB[row*o_ngroups+g2]);
+                for (int p2 = 0; p2 < GROUP_SIZE/8; p2++) {
+                    uint32_t pk = oW[row*o_packed + g2*(GROUP_SIZE/8) + p2];
+                    for (int nn = 0; nn < 8; nn++) {
+                        uint32_t nib = (pk >> (nn*4)) & 0xF;
+                        acc += ((float)nib * sc + bi) * attn_in[g2*GROUP_SIZE + p2*8 + nn];
+                    }
+                }
+            }
+            fprintf(stderr, "[DBG] CPU o_proj[%d]=%.6f GPU=%.6f\n", row, acc, op[row]);
+        }
         float* h = (float*)vk_buf_map(bufs->hidden);
         fprintf(stderr, "[DBG] L0 after residual+o_proj: rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
                 vec_rms(h, HIDDEN_DIM), h[0], h[1], h[2], h[3], h[4]);
