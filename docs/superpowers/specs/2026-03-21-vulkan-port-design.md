@@ -131,8 +131,8 @@ Allocated at startup, maintained across tokens:
 - Allocated as CPU-accessible buffers (used by BLAS on CPU in initial port)
 
 **Conv1d state (45 layers):**
-- Per-layer: kernel_size=3 x (q_dim + k_dim + v_dim + ...) x float32
-- ~3 x 12288 x 4 = ~144 KB/layer, ~6.3 MB total
+- Per-layer: conv_kernel_size=4, storing (kernel_size-1)=3 previous steps x conv_dim
+- (CONV_KERNEL_SIZE-1) x 12288 x float32 = 3 x 12288 x 4 = ~144 KB/layer, ~6.3 MB total
 - CPU-accessible buffers
 
 **KV cache (15 full-attention layers):**
@@ -185,7 +185,7 @@ KV cache is read/written during these dispatches.
 
 ### `sigmoid_gate.comp`
 
-Element-wise `out[i] = x[i] * sigmoid(gate[i])`. Used in CMD2 for the 15 full-attention layers' output gating.
+Element-wise `out[i] = x[i] * sigmoid(gate[i])`. Used in CMD2 for the 15 full-attention layers' output gating. Note: this is distinct from the shared expert sigmoid gate which is computed inline within `moe_combine.comp`.
 
 ### `residual_add.comp`
 
@@ -242,7 +242,7 @@ void io_ring_read_experts(IoRing*,
 ### Full forward pass (per token)
 
 ```
-1. Embedding lookup: dequant row fetch from [248320, 512] weight → 4096-dim hidden
+1. Embedding lookup (CPU): dequant single row from [248320, 512] 4-bit weight → 4096-dim hidden (trivially fast, microseconds)
 2. For each of 60 layers: fused_layer_forward (see below)
 3. Final RMS norm
 4. lm_head projection: dequant_matvec [4096] → [248320] (largest single matvec)
@@ -251,6 +251,10 @@ void io_ring_read_experts(IoRing*,
 ```
 
 The lm_head matvec dispatches ~31040 threadgroups (248320 / 8 rows per TG). At 212 GB/s bandwidth this is a significant per-token cost (~several ms). This is unavoidable — it's the same bottleneck on every LLM.
+
+### Layer type routing
+
+Of 60 layers, every 4th layer (indices 3, 7, 11, ..., 59) uses full attention (15 total). The remaining 45 use GatedDeltaNet linear attention. The layer type determines whether CMD1 output feeds into GPU attention kernels or CPU BLAS linear attention.
 
 ### Per-layer pipeline (fused_layer_forward)
 
@@ -269,7 +273,7 @@ CMD1: attention projections (dequant_matvec)      [~3.1ms GPU]
 
 **Single-buffered expert data:** One set of K=4 expert VkBufs. Double-buffering is scaffolding for future I/O overlap — not needed for serial mode.
 
-**Deferred CMD3:** Submitted without fence wait. Vulkan queue serializes via pipeline barriers: CMD2 → CMD3 → next CMD1.
+**Deferred CMD3:** All three stages (CMD1, CMD2, CMD3) are encoded into a single VkCommandBuffer per layer with `vkCmdPipelineBarrier2` between stages. This guarantees in-order execution within the command buffer without explicit semaphores. The "deferred" aspect means we submit the command buffer and don't fence-wait until the next layer needs results — the GPU processes CMD3 while the CPU prepares the next layer's routing and I/O.
 
 **Per-token estimate:**
 - Cold cache: 60 layers x ~9-10ms = 540-600ms → ~1.0-1.1 tok/s
