@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 #define MAX_TENSOR_NAME 256
-#define MAX_TENSORS 2048
+#define MAX_TENSORS 4096
 #define MAX_DIMS 4
 
 typedef struct {
