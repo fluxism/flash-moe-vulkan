@@ -1,7 +1,7 @@
 # Makefile for vulkan_infer — Vulkan/Linux MoE inference engine
 CC = gcc
-CFLAGS = -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE
-LDFLAGS = -lvulkan -luring -lopenblas -lpthread -lm
+CFLAGS = -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -Ideps
+LDFLAGS = -ldl -luring -lopenblas -lpthread -lm
 
 GLSLC = glslc
 
@@ -26,7 +26,7 @@ $(INFER_TARGET): $(INFER_SRC) vk_compute.h io_ring.h
 	$(CC) $(CFLAGS) $(INFER_SRC) -o $(INFER_TARGET) $(LDFLAGS)
 
 test_vk: test_vk.c vk_compute.c deps/volk.c shaders/test_add.spv
-	$(CC) $(CFLAGS) test_vk.c vk_compute.c deps/volk.c -o test_vk $(LDFLAGS)
+	$(CC) $(CFLAGS) test_vk.c vk_compute.c deps/volk.c -o test_vk -ldl -lpthread -lm
 
 test_io: test_io.c io_ring.c
 	$(CC) $(CFLAGS) test_io.c io_ring.c -o test_io -luring -lm
