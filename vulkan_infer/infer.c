@@ -663,48 +663,12 @@ static int sample_top_p(const float* logits, int vocab_size,
 }
 
 // ============================================================================
-// Token decoding (vocab.bin)
+// Token decoding — uses the bpe_tokenizer's vocab directly
 // ============================================================================
 
-typedef struct {
-    char** tokens;
-    int count;
-} Vocab;
-
-static Vocab* vocab_load(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "ERROR: cannot open vocab %s\n", path); return NULL; }
-
-    uint32_t count;
-    if (fread(&count, 4, 1, f) != 1) { fclose(f); return NULL; }
-
-    Vocab* v = malloc(sizeof(Vocab));
-    v->count = count;
-    v->tokens = calloc(count, sizeof(char*));
-
-    for (uint32_t i = 0; i < count; i++) {
-        uint16_t len;
-        if (fread(&len, 2, 1, f) != 1) break;
-        v->tokens[i] = malloc(len + 1);
-        if (fread(v->tokens[i], 1, len, f) != len) break;
-        v->tokens[i][len] = '\0';
-    }
-
-    fclose(f);
-    fprintf(stderr, "[init] Loaded vocab: %d tokens\n", v->count);
-    return v;
-}
-
-static const char* decode_token(Vocab* v, int token_id) {
-    if (!v || token_id < 0 || token_id >= v->count) return "<unk>";
-    return v->tokens[token_id] ? v->tokens[token_id] : "<unk>";
-}
-
-static void vocab_free(Vocab* v) {
-    if (!v) return;
-    for (int i = 0; i < v->count; i++) free(v->tokens[i]);
-    free(v->tokens);
-    free(v);
+static const char* decode_token(bpe_tokenizer* tok, int token_id) {
+    if (!tok || token_id < 0 || (uint32_t)token_id >= tok->vocab_size) return "<unk>";
+    return tok->vocab[token_id].str ? tok->vocab[token_id].str : "<unk>";
 }
 
 // ============================================================================
@@ -1102,9 +1066,8 @@ int main(int argc, char** argv) {
     build_layer_cache(wf);
 
     // ---- Load tokenizer ----
-    char tok_path[512], vocab_path[512];
+    char tok_path[512];
     snprintf(tok_path, sizeof(tok_path), "%s/tokenizer.bin", model_dir);
-    snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.bin", model_dir);
 
     bpe_tokenizer tok;
     if (bpe_load(&tok, tok_path) != 0) {
@@ -1114,20 +1077,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    Vocab* vocab = vocab_load(vocab_path);
-    if (!vocab) {
-        fprintf(stderr, "FATAL: vocab_load() failed\n");
-        bpe_free(&tok);
-        weights_destroy(ctx, wf);
-        vk_destroy(ctx);
-        return 1;
-    }
-
     // ---- Create io_uring ----
     IoRing* ring = io_ring_create(16);
     if (!ring) {
         fprintf(stderr, "FATAL: io_ring_create() failed\n");
-        vocab_free(vocab);
+        // vocab is part of bpe_tokenizer, freed by bpe_free
         bpe_free(&tok);
         weights_destroy(ctx, wf);
         vk_destroy(ctx);
@@ -1337,7 +1291,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[ttft] %.0f ms (prefill %d tokens)\n", ttft_ms, num_prompt);
 
     // Print first token
-    printf("%s", decode_token(vocab, next_token));
+    printf("%s", decode_token(&tok, next_token));
     fflush(stdout);
 
     // ---- Autoregressive generation loop ----
@@ -1401,7 +1355,7 @@ int main(int argc, char** argv) {
         total_generated++;
 
         // Print decoded token
-        printf("%s", decode_token(vocab, next_token));
+        printf("%s", decode_token(&tok, next_token));
         fflush(stdout);
 
         double t_gen_end = now_ms();
@@ -1476,7 +1430,7 @@ cleanup:
     vk_pipe_destroy(ctx, pipes.attn_values);
 
     io_ring_destroy(ring);
-    vocab_free(vocab);
+    // vocab is part of bpe_tokenizer, freed by bpe_free
     bpe_free(&tok);
     weights_destroy(ctx, wf);
     vk_destroy(ctx);
