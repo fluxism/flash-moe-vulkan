@@ -13,6 +13,21 @@ metal_infer/model_weights.json
 metal_infer/vocab.bin
 metal_infer/tokenizer.bin
 
+# Vulkan build artifacts
+vulkan_infer/infer
+vulkan_infer/test_vk
+vulkan_infer/test_io
+vulkan_infer/test_matvec
+vulkan_infer/shaders/*.spv
+vulkan_infer/pipeline_cache.bin
+vulkan_infer/model_weights.bin
+vulkan_infer/model_weights.json
+vulkan_infer/tokenizer.bin
+vulkan_infer/packed_experts
+
+# Model files (large, download separately)
+model/
+
 # Python
 __pycache__/
 *.pyc
