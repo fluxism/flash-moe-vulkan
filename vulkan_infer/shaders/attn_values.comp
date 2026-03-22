@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Scores { float scores[]; };    // [num_heads, seq_stride]
+layout(binding = 1) readonly buffer VCache  { float v_cache[]; }; // [max_seq, kv_dim]
+layout(binding = 2) writeonly buffer Out    { float out_data[]; };// [num_heads, head_dim]
+
+layout(push_constant) uniform Params {
+    uint head_dim;      // 256
+    uint kv_dim;        // 512
+    uint seq_len;
+    uint seq_stride;    // MAX_SEQ_LEN
+    uint heads_per_kv;  // 16
+};
+
+void main() {
+    // One thread per (head, dimension): linearized as d + h * head_dim
+    uint tid = gl_GlobalInvocationID.x;
+    uint d   = tid % head_dim;
+    uint h   = tid / head_dim;
+
+    uint kv_h = h / heads_per_kv;
+
+    float acc = 0.0;
+    for (uint p = 0u; p < seq_len; p++) {
+        acc += scores[h * seq_stride + p] * v_cache[p * kv_dim + kv_h * head_dim + d];
+    }
+    out_data[h * head_dim + d] = acc;
+}

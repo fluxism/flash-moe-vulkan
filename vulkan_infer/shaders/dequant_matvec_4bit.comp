@@ -1,0 +1,88 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer WPacked { uint w_packed[]; };
+layout(binding = 1) readonly buffer Scales  { uint scales_raw[]; };
+layout(binding = 2) readonly buffer Biases  { uint biases_raw[]; };
+layout(binding = 3) readonly buffer X       { float x[]; };
+layout(binding = 4) writeonly buffer Out    { float out_data[]; };
+
+layout(push_constant) uniform Params {
+    uint out_dim;
+    uint in_dim;
+    uint group_size;
+};
+
+float bf16_to_f32(uint raw_pair, uint which) {
+    uint bf16 = (which == 0u) ? (raw_pair & 0xFFFFu) : (raw_pair >> 16u);
+    return uintBitsToFloat(bf16 << 16u);
+}
+
+// Max in_dim across all projections:
+// QKV=4096, Z=4096, O=8192, lm_head=4096, routing=4096, experts=4096/1024
+shared float x_shared[8192];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint tgid = gl_WorkGroupID.x;
+    uint simd_lane = gl_SubgroupInvocationID;
+    uint simd_group = gl_SubgroupID;
+    uint subgroup_sz = gl_SubgroupSize;
+    uint rows_per_tg = 256u / subgroup_sz;
+
+    uint row = tgid * rows_per_tg + simd_group;
+    uint packed_cols = in_dim / 8u;
+    uint num_groups = in_dim / group_size;
+
+    // Cooperative load of input vector into shared memory
+    // ALL threads must participate before the barrier, even if their row is OOB
+    for (uint i = lid; i < in_dim; i += 256u) {
+        x_shared[i] = x[i];
+    }
+    barrier();
+
+    if (row >= out_dim) return;
+
+    uint w_row_base = row * packed_cols;
+    uint s_row_base = row * num_groups;
+
+    float acc = 0.0;
+
+    for (uint col = simd_lane; col < packed_cols; col += subgroup_sz) {
+        uint g = col / (group_size / 8u);
+        uint s_idx = s_row_base + g;
+
+        float scale = bf16_to_f32(scales_raw[s_idx / 2u], s_idx & 1u);
+        float bias  = bf16_to_f32(biases_raw[s_idx / 2u], s_idx & 1u);
+
+        uint packed = w_packed[w_row_base + col];
+        uint x_base = col * 8u;
+
+        // FMA optimization: precompute scale*x and bias*x
+        float sx0 = scale * x_shared[x_base + 0u]; float bx0 = bias * x_shared[x_base + 0u];
+        float sx1 = scale * x_shared[x_base + 1u]; float bx1 = bias * x_shared[x_base + 1u];
+        float sx2 = scale * x_shared[x_base + 2u]; float bx2 = bias * x_shared[x_base + 2u];
+        float sx3 = scale * x_shared[x_base + 3u]; float bx3 = bias * x_shared[x_base + 3u];
+        float sx4 = scale * x_shared[x_base + 4u]; float bx4 = bias * x_shared[x_base + 4u];
+        float sx5 = scale * x_shared[x_base + 5u]; float bx5 = bias * x_shared[x_base + 5u];
+        float sx6 = scale * x_shared[x_base + 6u]; float bx6 = bias * x_shared[x_base + 6u];
+        float sx7 = scale * x_shared[x_base + 7u]; float bx7 = bias * x_shared[x_base + 7u];
+
+        acc += fma(float((packed >>  0u) & 0xFu), sx0, bx0);
+        acc += fma(float((packed >>  4u) & 0xFu), sx1, bx1);
+        acc += fma(float((packed >>  8u) & 0xFu), sx2, bx2);
+        acc += fma(float((packed >> 12u) & 0xFu), sx3, bx3);
+        acc += fma(float((packed >> 16u) & 0xFu), sx4, bx4);
+        acc += fma(float((packed >> 20u) & 0xFu), sx5, bx5);
+        acc += fma(float((packed >> 24u) & 0xFu), sx6, bx6);
+        acc += fma(float((packed >> 28u) & 0xFu), sx7, bx7);
+    }
+
+    float sum = subgroupAdd(acc);
+
+    if (simd_lane == 0u) {
+        out_data[row] = sum;
+    }
+}
