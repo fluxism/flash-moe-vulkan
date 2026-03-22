@@ -161,6 +161,11 @@ typedef struct {
     void* A_log;      // float, accessed by CPU
     void* dt_bias;    // bf16, accessed by CPU
     void* gated_norm_w; // bf16, accessed by CPU
+    // GPU-side byte offsets into the weight VkBuf
+    size_t conv1d_w_off;   // bf16: [LINEAR_CONV_DIM * CONV_KERNEL_SIZE] packed as uint16
+    size_t A_log_off;      // float32: [LINEAR_NUM_V_HEADS]
+    size_t dt_bias_off;    // bf16: [LINEAR_NUM_V_HEADS] packed as uint16
+    size_t gated_norm_w_off; // bf16: [LINEAR_VALUE_DIM] packed as uint16
     // Post-attention norm
     size_t post_attn_norm_w_off;
     // Routing
@@ -282,12 +287,16 @@ static void build_layer_cache(WeightFile* wf) {
             // CPU-side linear attn params (direct pointers)
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", l);
             lc->conv1d_w = get_tensor_ptr(wf, name);
+            lc->conv1d_w_off = get_tensor_offset(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", l);
             lc->A_log = get_tensor_ptr(wf, name);
+            lc->A_log_off = get_tensor_offset(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", l);
             lc->dt_bias = get_tensor_ptr(wf, name);
+            lc->dt_bias_off = get_tensor_offset(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", l);
             lc->gated_norm_w = get_tensor_ptr(wf, name);
+            lc->gated_norm_w_off = get_tensor_offset(wf, name);
 
             lc->q_proj_dim = LINEAR_CONV_DIM;           // 12288
             lc->kv_dim = 0;
@@ -356,6 +365,12 @@ typedef struct {
     VkPipe* attn_scores;
     VkPipe* attn_softmax;
     VkPipe* attn_values;
+    // GPU linear attention (GatedDeltaNet)
+    VkPipe* conv1d_step;
+    VkPipe* rms_norm_qk;
+    VkPipe* compute_decay_beta;
+    VkPipe* gated_delta_net_step;
+    VkPipe* gated_rms_norm;
 } Pipelines;
 
 // ============================================================================
@@ -406,6 +421,16 @@ typedef struct {
     VkBuf* kv_k[NUM_FULL_ATTN_LAYERS]; // [FA_MAX_SEQ_LEN * FA_KV_DIM]
     VkBuf* kv_v[NUM_FULL_ATTN_LAYERS];
     VkBuf* attn_scores_buf; // [FA_NUM_ATTN_HEADS * FA_MAX_SEQ_LEN]
+
+    // GPU linear attention persistent state (per linear layer)
+    VkBuf* conv_state[NUM_LINEAR_LAYERS];     // [(CONV_KERNEL_SIZE-1) * LINEAR_CONV_DIM] float per layer
+    VkBuf* delta_state[NUM_LINEAR_LAYERS];    // [LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM] float per layer
+
+    // GPU linear attention scratch buffers
+    VkBuf* conv_output;        // [LINEAR_CONV_DIM] float
+    VkBuf* delta_g_decay;      // [LINEAR_NUM_V_HEADS] float
+    VkBuf* delta_beta;         // [LINEAR_NUM_V_HEADS] float
+    VkBuf* delta_output;       // [LINEAR_TOTAL_VALUE] float
 } Buffers;
 
 // ============================================================================
@@ -696,7 +721,7 @@ static void fused_layer_forward(
     int layer_idx,
     float* hidden,       // [HIDDEN_DIM] CPU in/out
     KVCache* kv,         // non-NULL for full attention layers
-    LinearAttnState* la_state, // non-NULL for linear attention layers
+    LinearAttnState* la_state __attribute__((unused)), // non-NULL for linear attention layers
     int pos,
     int packed_fd,
     IoRing* ring)
@@ -829,6 +854,122 @@ static void fused_layer_forward(
                 wf->buf, lc->alpha_w_off, wf->buf, lc->alpha_s_off, wf->buf, lc->alpha_b_off,
                 bufs->normed, bufs->attn_proj5,
                 LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE);
+            vk_cmd_barrier(cmd);
+
+            // =============================================================
+            // Phase 2b: GPU linear attention (GatedDeltaNet)
+            // Replaces CPU BLAS path — 5 compute shaders in same cmd buffer
+            // =============================================================
+            int linear_layer_idx = layer_idx - (layer_idx + 1) / FULL_ATTN_INTERVAL;
+
+            // L1: conv1d_step
+            {
+                uint32_t conv_dim = LINEAR_CONV_DIM;
+                VkBuf* conv_bufs[] = { bufs->conv_state[linear_layer_idx],
+                                       bufs->attn_proj, wf->buf, bufs->conv_output };
+                // conv_state: (CONV_KERNEL_SIZE-1) * LINEAR_CONV_DIM floats
+                // input: LINEAR_CONV_DIM floats
+                // weights: LINEAR_CONV_DIM * CONV_KERNEL_SIZE bf16 = LINEAR_CONV_DIM*4 uint16 = LINEAR_CONV_DIM*2 uint32
+                // output: LINEAR_CONV_DIM floats
+                size_t conv_offsets[] = { 0, 0, lc->conv1d_w_off, 0 };
+                size_t conv_ranges[] = {
+                    (CONV_KERNEL_SIZE-1) * LINEAR_CONV_DIM * sizeof(float),
+                    LINEAR_CONV_DIM * sizeof(float),
+                    LINEAR_CONV_DIM * CONV_KERNEL_SIZE * sizeof(uint16_t),
+                    LINEAR_CONV_DIM * sizeof(float)
+                };
+                vk_cmd_bind(cmd, pipes->conv1d_step, conv_bufs, conv_offsets, conv_ranges, 4,
+                            &conv_dim, sizeof(conv_dim));
+                vk_cmd_dispatch(cmd, (LINEAR_CONV_DIM + 255) / 256, 1, 1);
+            }
+            vk_cmd_barrier(cmd);
+
+            // L2: rms_norm_qk (q at offset 0, k at offset LINEAR_TOTAL_KEY in conv_output)
+            {
+                struct { uint32_t key_dim; float inv_scale; } pc = {
+                    LINEAR_KEY_DIM, 1.0f / sqrtf((float)LINEAR_KEY_DIM)
+                };
+                VkBuf* qk_bufs[] = { bufs->conv_output, bufs->conv_output };
+                size_t qk_offsets[] = { 0, LINEAR_TOTAL_KEY * sizeof(float) };
+                size_t qk_ranges[] = {
+                    LINEAR_TOTAL_KEY * sizeof(float),
+                    LINEAR_TOTAL_KEY * sizeof(float)
+                };
+                vk_cmd_bind(cmd, pipes->rms_norm_qk, qk_bufs, qk_offsets, qk_ranges, 2,
+                            &pc, sizeof(pc));
+                vk_cmd_dispatch(cmd, LINEAR_NUM_K_HEADS, 1, 1);
+            }
+            vk_cmd_barrier(cmd);
+
+            // L3: compute_decay_beta
+            {
+                VkBuf* db_bufs[] = { bufs->attn_proj5, bufs->attn_proj4,
+                                     wf->buf, wf->buf,
+                                     bufs->delta_g_decay, bufs->delta_beta };
+                size_t db_offsets[] = { 0, 0, lc->A_log_off, lc->dt_bias_off, 0, 0 };
+                size_t db_ranges[] = {
+                    LINEAR_NUM_V_HEADS * sizeof(float),   // alpha_out
+                    LINEAR_NUM_V_HEADS * sizeof(float),   // beta_out
+                    LINEAR_NUM_V_HEADS * sizeof(float),   // A_log (float32)
+                    LINEAR_NUM_V_HEADS * sizeof(uint16_t),// dt_bias (bf16)
+                    LINEAR_NUM_V_HEADS * sizeof(float),   // g_decay out
+                    LINEAR_NUM_V_HEADS * sizeof(float)    // beta_gate out
+                };
+                vk_cmd_bind(cmd, pipes->compute_decay_beta, db_bufs, db_offsets, db_ranges, 6,
+                            NULL, 0);
+                vk_cmd_dispatch(cmd, 1, 1, 1); // 256 threads, only 64 active
+            }
+            vk_cmd_barrier(cmd);
+
+            // L4: gated_delta_net_step
+            {
+                uint32_t k_heads_per_v = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS; // 4
+                VkBuf* dn_bufs[] = {
+                    bufs->delta_state[linear_layer_idx],
+                    bufs->conv_output, bufs->conv_output, bufs->conv_output,
+                    bufs->delta_g_decay, bufs->delta_beta, bufs->delta_output
+                };
+                size_t dn_offsets[] = {
+                    0,
+                    0,                                        // q at start
+                    LINEAR_TOTAL_KEY * sizeof(float),         // k after q
+                    2 * LINEAR_TOTAL_KEY * sizeof(float),     // v after q+k
+                    0, 0, 0
+                };
+                size_t dn_ranges[] = {
+                    (size_t)LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float),
+                    LINEAR_TOTAL_KEY * sizeof(float),         // q
+                    LINEAR_TOTAL_KEY * sizeof(float),         // k
+                    LINEAR_TOTAL_VALUE * sizeof(float),       // v
+                    LINEAR_NUM_V_HEADS * sizeof(float),       // g_decay
+                    LINEAR_NUM_V_HEADS * sizeof(float),       // beta
+                    LINEAR_TOTAL_VALUE * sizeof(float)        // output
+                };
+                vk_cmd_bind(cmd, pipes->gated_delta_net_step, dn_bufs, dn_offsets, dn_ranges, 7,
+                            &k_heads_per_v, sizeof(k_heads_per_v));
+                vk_cmd_dispatch(cmd, LINEAR_NUM_V_HEADS, 1, 1); // 64 workgroups, 128 threads each
+            }
+            vk_cmd_barrier(cmd);
+
+            // L5: gated_rms_norm
+            {
+                struct { uint32_t value_dim; float eps; } pc = {
+                    LINEAR_VALUE_DIM, 1e-6f
+                };
+                VkBuf* gn_bufs[] = { bufs->delta_output, bufs->attn_proj2,
+                                     wf->buf, bufs->attn_out };
+                size_t gn_offsets[] = { 0, 0, lc->gated_norm_w_off, 0 };
+                size_t gn_ranges[] = {
+                    LINEAR_TOTAL_VALUE * sizeof(float),        // values
+                    LINEAR_TOTAL_VALUE * sizeof(float),        // z
+                    LINEAR_VALUE_DIM * sizeof(uint16_t),       // weight (bf16, shared across heads)
+                    LINEAR_TOTAL_VALUE * sizeof(float)         // output
+                };
+                vk_cmd_bind(cmd, pipes->gated_rms_norm, gn_bufs, gn_offsets, gn_ranges, 4,
+                            &pc, sizeof(pc));
+                vk_cmd_dispatch(cmd, LINEAR_NUM_V_HEADS, 1, 1); // 64 workgroups, 128 threads each
+            }
+            vk_cmd_barrier(cmd);
         }
 
         vk_cmd_submit(cmd);
@@ -857,24 +998,7 @@ static void fused_layer_forward(
         memcpy(vk_buf_map(bufs->attn_out), attn_out, FA_O_PROJ_IN_DIM * sizeof(float));
         attn_out_dim = FA_O_PROJ_IN_DIM;
     } else {
-        // Read back QKV, Z, beta, alpha from GPU
-        float* qkv_proj = (float*)vk_buf_map(bufs->attn_proj);   // [12288]
-        float* z_proj   = (float*)vk_buf_map(bufs->attn_proj2);  // [8192]
-        float* beta_proj  = (float*)vk_buf_map(bufs->attn_proj4);  // [64]
-        float* alpha_proj = (float*)vk_buf_map(bufs->attn_proj5);  // [64]
-
-        float attn_out[LINEAR_TOTAL_VALUE]; // [8192]
-        linear_attn_forward(
-            la_state,
-            qkv_proj, z_proj, beta_proj, alpha_proj,
-            (const uint16_t*)lc->conv1d_w,
-            (const float*)lc->A_log,
-            (const uint16_t*)lc->dt_bias,
-            (const uint16_t*)lc->gated_norm_w,
-            attn_out
-        );
-
-        memcpy(vk_buf_map(bufs->attn_out), attn_out, LINEAR_TOTAL_VALUE * sizeof(float));
+        // GPU linear attention already computed in Phase 2b — output is in bufs->attn_out
         attn_out_dim = LINEAR_TOTAL_VALUE;
     }
     if (g_timing_enabled) { t1 = now_ms(); g_timing.cpu_attn += t1 - t0; }
@@ -1246,6 +1370,22 @@ int main(int argc, char** argv) {
     snprintf(shader_path, sizeof(shader_path), "%s/shaders/attn_values.spv", model_dir);
     pipes.attn_values = vk_pipe_create(ctx, shader_path, 20, 3); // 5x uint32, 3 bindings
 
+    // GPU linear attention (GatedDeltaNet) pipelines
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/conv1d_step.spv", model_dir);
+    pipes.conv1d_step = vk_pipe_create(ctx, shader_path, 4, 4); // 1x uint32, 4 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/rms_norm_qk.spv", model_dir);
+    pipes.rms_norm_qk = vk_pipe_create(ctx, shader_path, 8, 2); // uint32+float, 2 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/compute_decay_beta.spv", model_dir);
+    pipes.compute_decay_beta = vk_pipe_create(ctx, shader_path, 0, 6); // no push, 6 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/gated_delta_net_step.spv", model_dir);
+    pipes.gated_delta_net_step = vk_pipe_create(ctx, shader_path, 4, 7); // 1x uint32, 7 bindings
+
+    snprintf(shader_path, sizeof(shader_path), "%s/shaders/gated_rms_norm.spv", model_dir);
+    pipes.gated_rms_norm = vk_pipe_create(ctx, shader_path, 8, 4); // uint32+float, 4 bindings
+
     fprintf(stderr, "[init] Pipelines created\n");
 
     // ---- Allocate scratch buffers ----
@@ -1287,6 +1427,18 @@ int main(int argc, char** argv) {
         buf.kv_k[i] = vk_buf_create(ctx, FA_MAX_SEQ_LEN * FA_KV_DIM * sizeof(float));
         buf.kv_v[i] = vk_buf_create(ctx, FA_MAX_SEQ_LEN * FA_KV_DIM * sizeof(float));
     }
+
+    // GPU linear attention state
+    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+        buf.conv_state[i] = vk_buf_create(ctx, (CONV_KERNEL_SIZE-1) * LINEAR_CONV_DIM * sizeof(float));
+        memset(vk_buf_map(buf.conv_state[i]), 0, (CONV_KERNEL_SIZE-1) * LINEAR_CONV_DIM * sizeof(float));
+        buf.delta_state[i] = vk_buf_create(ctx, LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
+        memset(vk_buf_map(buf.delta_state[i]), 0, LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
+    }
+    buf.conv_output = vk_buf_create(ctx, LINEAR_CONV_DIM * sizeof(float));
+    buf.delta_g_decay = vk_buf_create(ctx, LINEAR_NUM_V_HEADS * sizeof(float));
+    buf.delta_beta = vk_buf_create(ctx, LINEAR_NUM_V_HEADS * sizeof(float));
+    buf.delta_output = vk_buf_create(ctx, LINEAR_TOTAL_VALUE * sizeof(float));
 
     fprintf(stderr, "[init] Scratch buffers allocated\n");
 
@@ -1582,6 +1734,14 @@ cleanup:
         vk_buf_destroy(ctx, buf.kv_k[i]);
         vk_buf_destroy(ctx, buf.kv_v[i]);
     }
+    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+        vk_buf_destroy(ctx, buf.conv_state[i]);
+        vk_buf_destroy(ctx, buf.delta_state[i]);
+    }
+    vk_buf_destroy(ctx, buf.conv_output);
+    vk_buf_destroy(ctx, buf.delta_g_decay);
+    vk_buf_destroy(ctx, buf.delta_beta);
+    vk_buf_destroy(ctx, buf.delta_output);
 
     // Destroy pipelines
     vk_pipe_destroy(ctx, pipes.dequant_matvec);
@@ -1593,6 +1753,11 @@ cleanup:
     vk_pipe_destroy(ctx, pipes.attn_scores);
     vk_pipe_destroy(ctx, pipes.attn_softmax);
     vk_pipe_destroy(ctx, pipes.attn_values);
+    vk_pipe_destroy(ctx, pipes.conv1d_step);
+    vk_pipe_destroy(ctx, pipes.rms_norm_qk);
+    vk_pipe_destroy(ctx, pipes.compute_decay_beta);
+    vk_pipe_destroy(ctx, pipes.gated_delta_net_step);
+    vk_pipe_destroy(ctx, pipes.gated_rms_norm);
 
     io_ring_destroy(ring);
     // vocab is part of bpe_tokenizer, freed by bpe_free
