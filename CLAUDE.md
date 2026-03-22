@@ -8,26 +8,29 @@ No Python runtime. No frameworks. Pure C + GLSL compute shaders + io_uring.
 
 ## Vulkan Results
 
-| Hardware | tok/s | Quality | Bottleneck |
-|----------|-------|---------|------------|
-| AMD Ryzen AI Max+ 395 (Radeon 8060S) | **3.13** | Excellent | SSD throughput (I/O bound) |
+| Hardware | Cache | tok/s | Quality | Bottleneck |
+|----------|-------|-------|---------|------------|
+| AMD Ryzen AI Max+ 395 (Radeon 8060S) | Cold | **3.13** | Excellent | SSD throughput |
+| AMD Ryzen AI Max+ 395 (Radeon 8060S) | Warm | **4.80** | Excellent | SSD throughput |
 
 ### Per-Layer Timing Breakdown
 
 ```
-input_norm:       0.20 ms   (GPU)
-attn_proj:        0.55 ms   (GPU dequant matvec)
-gpu_attn:         0.09 ms   (GPU linear attention — was 9.83ms on CPU)
-o_proj:           0.27 ms   (GPU)
-post_norm:        0.36 ms   (GPU)
-expert_io:        3.78 ms   (NVMe SSD, ~7.4 GB/s)
-expert_compute:   0.02 ms   (GPU fused SwiGLU, deferred)
-moe_combine:      0.00 ms   (GPU, deferred)
-─────────────────────────────
-TOTAL:            5.32 ms/layer × 60 layers ≈ 3.13 tok/s
+                  Cold cache    Warm cache
+input_norm:       0.20 ms       0.19 ms     (GPU)
+attn_proj:        0.55 ms       0.54 ms     (GPU dequant matvec)
+gpu_attn:         0.09 ms       0.09 ms     (GPU linear attention)
+o_proj:           0.27 ms       0.28 ms     (GPU)
+post_norm:        0.36 ms       0.36 ms     (GPU)
+expert_io:        3.78 ms       1.62 ms     (NVMe SSD)
+expert_compute:   0.02 ms       0.01 ms     (GPU fused SwiGLU, deferred)
+moe_combine:      0.00 ms       0.00 ms     (GPU, deferred)
+──────────────────────────────────────────
+TOTAL:            5.32 ms       3.13 ms     per layer
+                  ≈ 3.13 tok/s  ≈ 4.80 tok/s
 ```
 
-Expert I/O dominates at 71% of per-layer time. GatedDeltaNet linear attention now runs entirely on GPU (5 compute shaders), down from 9.83ms on CPU BLAS to 0.09ms — a 109x speedup. Deferred command buffers overlap expert compute with next layer's I/O. SSD throughput (~7.4 GB/s) is the remaining bottleneck (vs Apple's 17.5 GB/s).
+Expert I/O dominates (71% cold, 52% warm). The OS page cache provides a ~71% hit rate during sustained generation, cutting expert_io from 3.78ms to 1.62ms. GatedDeltaNet linear attention runs entirely on GPU (5 compute shaders), down from 9.83ms on CPU BLAS to 0.09ms — a 109x speedup. Deferred command buffers overlap expert compute with next layer's I/O.
 
 ## Vulkan Quick Start
 
@@ -117,7 +120,7 @@ The key insight: only ~28MB of expert data is needed per layer per token. Instea
 | Hardware | Backend | tok/s | Quality | Notes |
 |----------|---------|-------|---------|-------|
 | M3 Max (48GB) | Metal | **4.36** | Excellent | Full tool calling. Production config. |
-| Ryzen AI Max+ 395 | Vulkan | **3.13** | Excellent | I/O-bound. GPU linear attn + deferred CMDs. |
+| Ryzen AI Max+ 395 | Vulkan | **3.13–4.80** | Excellent | I/O-bound. Cold/warm page cache. |
 | M3 Max (2-bit) | Metal | 5.74 | Good* | *Breaks JSON/tool calling. |
 
 The Vulkan port is slower due to hardware differences: 2.6x less memory bandwidth (212 vs 546 GB/s) and 2.4x slower SSD (7.4 vs 17.5 GB/s).
