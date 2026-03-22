@@ -10,24 +10,24 @@ No Python runtime. No frameworks. Pure C + GLSL compute shaders + io_uring.
 
 | Hardware | tok/s | Quality | Bottleneck |
 |----------|-------|---------|------------|
-| AMD Ryzen AI Max+ 395 (Radeon 8060S) | **0.75** | Excellent | SSD throughput + CPU linear attention |
+| AMD Ryzen AI Max+ 395 (Radeon 8060S) | **3.13** | Excellent | SSD throughput (I/O bound) |
 
 ### Per-Layer Timing Breakdown
 
 ```
-input_norm:       0.15 ms   (GPU)
-attn_proj:        0.43 ms   (GPU dequant matvec)
-cpu_attn:         9.83 ms   (CPU BLAS — dominant cost, GPU port planned)
-o_proj:           0.35 ms   (GPU)
-post_norm:        0.27 ms   (GPU)
-expert_io:        4.29 ms   (NVMe SSD, ~5 GB/s)
-expert_compute:   0.45 ms   (GPU fused SwiGLU)
-moe_combine:      0.09 ms   (GPU)
+input_norm:       0.20 ms   (GPU)
+attn_proj:        0.55 ms   (GPU dequant matvec)
+gpu_attn:         0.09 ms   (GPU linear attention — was 9.83ms on CPU)
+o_proj:           0.27 ms   (GPU)
+post_norm:        0.36 ms   (GPU)
+expert_io:        3.78 ms   (NVMe SSD, ~7.4 GB/s)
+expert_compute:   0.02 ms   (GPU fused SwiGLU, deferred)
+moe_combine:      0.00 ms   (GPU, deferred)
 ─────────────────────────────
-TOTAL:           15.81 ms/layer × 60 layers ≈ 0.75 tok/s
+TOTAL:            5.32 ms/layer × 60 layers ≈ 3.13 tok/s
 ```
 
-CPU linear attention (62% of per-layer time) uses BLAS for the 45 GatedDeltaNet layers. Porting those 5 GPU kernels would roughly halve the per-layer cost. SSD throughput (27%) is limited by PCIe 4.0 x4 (~5 GB/s vs Apple's 17.5 GB/s).
+Expert I/O dominates at 71% of per-layer time. GatedDeltaNet linear attention now runs entirely on GPU (5 compute shaders), down from 9.83ms on CPU BLAS to 0.09ms — a 109x speedup. Deferred command buffers overlap expert compute with next layer's I/O. SSD throughput (~7.4 GB/s) is the remaining bottleneck (vs Apple's 17.5 GB/s).
 
 ## Vulkan Quick Start
 
@@ -108,17 +108,19 @@ The key insight: only ~28MB of expert data is needed per layer per token. Instea
 
 3. **Fused Compute Kernels** — Gate+Up+SwiGLU in one kernel (single input read), MoE combine+residual fused, two-pass RMS norm with subgroup reduction.
 
-4. **BLAS-Accelerated Linear Attention** — GatedDeltaNet recurrence (64 heads x 128x128 state) via `cblas_sscal`, `cblas_sgemv`, `cblas_sger`.
+4. **GPU Linear Attention** — GatedDeltaNet recurrence (64 heads x 128x128 state) via 5 Vulkan compute shaders: `conv1d_step`, `gated_rms_norm`, `rms_norm_qk`, `compute_decay_beta`, `gated_delta_net_step`. 109x faster than CPU BLAS.
+
+5. **Deferred Command Buffers** — Expert compute and MoE combine run deferred, overlapping GPU work with next layer's SSD I/O. Merged 5 submit+waits per layer into 1–2.
 
 ## All Results
 
 | Hardware | Backend | tok/s | Quality | Notes |
 |----------|---------|-------|---------|-------|
 | M3 Max (48GB) | Metal | **4.36** | Excellent | Full tool calling. Production config. |
-| Ryzen AI Max+ 395 | Vulkan | **0.75** | Excellent | I/O-bound. CPU linear attn dominant. |
+| Ryzen AI Max+ 395 | Vulkan | **3.13** | Excellent | I/O-bound. GPU linear attn + deferred CMDs. |
 | M3 Max (2-bit) | Metal | 5.74 | Good* | *Breaks JSON/tool calling. |
 
-The Vulkan port is slower due to hardware differences: 2.6x less memory bandwidth (212 vs 546 GB/s) and 3x slower SSD (5 vs 17.5 GB/s).
+The Vulkan port is slower due to hardware differences: 2.6x less memory bandwidth (212 vs 546 GB/s) and 2.4x slower SSD (7.4 vs 17.5 GB/s).
 
 ## Project Structure
 
@@ -130,7 +132,7 @@ vulkan_infer/             # Vulkan/Linux backend (this port)
   weights.h/c             #   weight loading + JSON manifest parser
   linear_attn.h/c         #   CPU GatedDeltaNet via OpenBLAS
   full_attn.h/c           #   CPU full attention with RoPE + KV cache
-  shaders/                #   9 GLSL compute shaders → SPIR-V
+  shaders/                #   14 GLSL compute shaders → SPIR-V
     dequant_matvec_4bit.comp    FMA-optimized 4-bit dequant (critical path)
     fused_gate_up_swiglu.comp   Fused expert gate+up+SwiGLU
     rms_norm.comp               Two-pass RMS normalization
@@ -138,6 +140,11 @@ vulkan_infer/             # Vulkan/Linux backend (this port)
     attn_{scores,softmax,values}.comp   Full attention
     residual_add.comp           Element-wise residual
     sigmoid_gate.comp           Sigmoid gating
+    gated_delta_net_step.comp   GPU GatedDeltaNet recurrence
+    conv1d_step.comp            Short convolution for linear attn
+    compute_decay_beta.comp     Decay/beta gate computation
+    gated_rms_norm.comp         Gated RMS norm for linear attn
+    rms_norm_qk.comp            Q/K normalization
 
 metal_infer/              # Original Metal/macOS backend
   infer.m                 #   inference engine (~7000 lines Obj-C)
@@ -189,7 +196,8 @@ make
 | FMA dequant kernel | **+12% tok/s** |
 | Trust OS page cache | **+38%** (deleted custom LRU) |
 | GPU combine+norm | Eliminates CPU round-trip |
-| BLAS delta-net | **+64%** on attention |
+| GPU delta-net | **109x** faster than CPU BLAS |
+| Deferred command buffers | **+15%** (overlap GPU + SSD I/O) |
 | C BPE tokenizer | **20x** faster startup |
 
 ### Discarded (58 experiments)
