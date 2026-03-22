@@ -1,0 +1,55 @@
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) buffer Q { float q[]; };  // [num_k_heads * key_dim] in/out
+layout(binding = 1) buffer K { float k[]; };  // [num_k_heads * key_dim] in/out
+
+layout(push_constant) uniform Params {
+    uint  key_dim;    // = 128
+    float inv_scale;  // = 1/sqrt(key_dim)
+};
+
+shared float partial[128];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tid  = gl_LocalInvocationID.x;
+    uint base = head * key_dim;
+
+    // --- RMS norm for q ---
+    float qval = (tid < key_dim) ? q[base + tid] : 0.0;
+    partial[tid] = qval * qval;
+    barrier();
+
+    if (tid == 0u) {
+        float s = 0.0;
+        for (uint i = 0u; i < key_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    barrier();
+
+    float q_inv_rms = inversesqrt(partial[0] / float(key_dim) + 1e-6);
+    if (tid < key_dim) {
+        q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;
+    }
+
+    barrier();
+
+    // --- RMS norm for k ---
+    float kval = (tid < key_dim) ? k[base + tid] : 0.0;
+    partial[tid] = kval * kval;
+    barrier();
+
+    if (tid == 0u) {
+        float s = 0.0;
+        for (uint i = 0u; i < key_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    barrier();
+
+    float k_inv_rms = inversesqrt(partial[0] / float(key_dim) + 1e-6);
+    if (tid < key_dim) {
+        k[base + tid] = kval * k_inv_rms * inv_scale;
+    }
+}

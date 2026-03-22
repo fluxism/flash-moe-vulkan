@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly buffer Values { float values[]; };    // [num_v_heads * value_dim]
+layout(binding = 1) readonly buffer Z      { float z[]; };         // [num_v_heads * value_dim]
+layout(binding = 2) readonly buffer Weight { uint  w_raw[]; };     // [value_dim] bf16 packed
+layout(binding = 3) writeonly buffer Output { float out_data[]; }; // [num_v_heads * value_dim]
+
+layout(push_constant) uniform Params {
+    uint  value_dim;  // = 128
+    float eps;        // = 1e-6
+};
+
+shared float partial[128];
+
+float bf16_to_f32(uint raw_pair, uint which) {
+    uint bf16 = (which == 0u) ? (raw_pair & 0xFFFFu) : (raw_pair >> 16u);
+    return uintBitsToFloat(bf16 << 16u);
+}
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tid  = gl_LocalInvocationID.x;
+    uint base = head * value_dim;
+
+    float val = (tid < value_dim) ? values[base + tid] : 0.0;
+
+    // RMS norm reduction
+    partial[tid] = val * val;
+    barrier();
+
+    if (tid == 0u) {
+        float s = 0.0;
+        for (uint i = 0u; i < value_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    barrier();
+
+    float inv_rms = inversesqrt(partial[0] / float(value_dim) + eps);
+
+    if (tid < value_dim) {
+        float normed = val * inv_rms;
+        float zval = z[base + tid];
+        float gate = zval / (1.0 + exp(-zval));  // SiLU
+        float w = bf16_to_f32(w_raw[tid / 2u], tid % 2u);
+        out_data[base + tid] = normed * gate * w;
+    }
+}

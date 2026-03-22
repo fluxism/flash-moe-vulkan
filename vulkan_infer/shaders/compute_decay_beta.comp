@@ -1,0 +1,27 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer AlphaOut  { float alpha_out[]; };  // [num_v_heads]
+layout(binding = 1) readonly buffer BetaOut   { float beta_out[]; };   // [num_v_heads]
+layout(binding = 2) readonly buffer ALog      { float A_log[]; };      // [num_v_heads]
+layout(binding = 3) readonly buffer DtBias    { uint  dt_bias_raw[]; }; // [num_v_heads] bf16 packed
+layout(binding = 4) writeonly buffer GDecay   { float g_decay[]; };    // [num_v_heads]
+layout(binding = 5) writeonly buffer BetaGate { float beta_gate[]; };  // [num_v_heads]
+
+float bf16_to_f32(uint raw_pair, uint which) {
+    uint bf16 = (which == 0u) ? (raw_pair & 0xFFFFu) : (raw_pair >> 16u);
+    return uintBitsToFloat(bf16 << 16u);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= 64u) return;
+
+    float a_val = alpha_out[idx];
+    float dt_b = bf16_to_f32(dt_bias_raw[idx / 2u], idx % 2u);
+    float A_val = exp(A_log[idx]);
+    float softplus_val = log(1.0 + exp(a_val + dt_b));
+    g_decay[idx] = exp(-A_val * softplus_val);
+    beta_gate[idx] = 1.0 / (1.0 + exp(-beta_out[idx]));
+}

@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) buffer State     { float state[]; };    // [64 * 128 * 128] persistent
+layout(binding = 1) readonly buffer Q       { float q[]; };        // [2048]
+layout(binding = 2) readonly buffer K       { float k[]; };        // [2048]
+layout(binding = 3) readonly buffer V       { float v[]; };        // [8192]
+layout(binding = 4) readonly buffer GDecay  { float g_decay[]; };  // [64]
+layout(binding = 5) readonly buffer Beta    { float beta_gate[]; };// [64]
+layout(binding = 6) writeonly buffer Output { float out_data[]; }; // [8192]
+
+layout(push_constant) uniform Params {
+    uint k_heads_per_v;  // = 4
+};
+
+void main() {
+    uint head_id = gl_WorkGroupID.x;   // 0..63 (v-head)
+    uint vi      = gl_LocalInvocationID.x;  // 0..127
+
+    uint kh = head_id / k_heads_per_v;
+    float g = g_decay[head_id];
+    float beta = beta_gate[head_id];
+
+    uint state_base = head_id * 128u * 128u + vi * 128u;
+    uint k_base = kh * 128u;
+    uint v_base = head_id * 128u;
+
+    // Step 1+2: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
+    float kv_mem = 0.0;
+    for (uint ki = 0u; ki < 128u; ki++) {
+        float s = state[state_base + ki] * g;
+        state[state_base + ki] = s;
+        kv_mem += s * k[k_base + ki];
+    }
+
+    // Step 3+4: Delta update
+    float delta = (v[v_base + vi] - kv_mem) * beta;
+    for (uint ki = 0u; ki < 128u; ki++) {
+        state[state_base + ki] += k[k_base + ki] * delta;
+    }
+
+    // Step 5: Output
+    float out_val = 0.0;
+    for (uint ki = 0u; ki < 128u; ki++) {
+        out_val += state[state_base + ki] * q[k_base + ki];
+    }
+    out_data[v_base + vi] = out_val;
+}

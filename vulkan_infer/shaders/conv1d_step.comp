@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) buffer ConvState  { float conv_state[]; };  // [(kernel_size-1) * conv_dim]
+layout(binding = 1) readonly buffer Input   { float inp[]; };   // [conv_dim]
+layout(binding = 2) readonly buffer Weights { uint  w_raw[]; }; // [conv_dim * 4] bf16 packed as uint pairs
+layout(binding = 3) writeonly buffer Output { float out_data[]; }; // [conv_dim]
+
+layout(push_constant) uniform Params {
+    uint conv_dim;
+};
+
+float bf16_to_f32(uint raw_pair, uint which) {
+    uint bf16 = (which == 0u) ? (raw_pair & 0xFFFFu) : (raw_pair >> 16u);
+    return uintBitsToFloat(bf16 << 16u);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= conv_dim) return;
+
+    // Each channel has 4 bf16 weights packed into 2 uint32s
+    // weight[c * 4 + k]: pair index = (c*4+k)/2, which = (c*4+k)%2
+    uint w_base = idx * 4u;  // bf16 element index
+
+    // Read 4 bf16 weights
+    float w0 = bf16_to_f32(w_raw[(w_base + 0u) / 2u], (w_base + 0u) % 2u);
+    float w1 = bf16_to_f32(w_raw[(w_base + 1u) / 2u], (w_base + 1u) % 2u);
+    float w2 = bf16_to_f32(w_raw[(w_base + 2u) / 2u], (w_base + 2u) % 2u);
+    float w3 = bf16_to_f32(w_raw[(w_base + 3u) / 2u], (w_base + 3u) % 2u);
+
+    // Dot product: 3 history slots + new input
+    float acc = 0.0;
+    acc += conv_state[0u * conv_dim + idx] * w0;
+    acc += conv_state[1u * conv_dim + idx] * w1;
+    acc += conv_state[2u * conv_dim + idx] * w2;
+
+    float x = inp[idx];
+    acc += x * w3;
+
+    // SiLU activation
+    out_data[idx] = acc / (1.0 + exp(-acc));
+
+    // Shift history: slot[0]=slot[1], slot[1]=slot[2], slot[2]=input
+    conv_state[0u * conv_dim + idx] = conv_state[1u * conv_dim + idx];
+    conv_state[1u * conv_dim + idx] = conv_state[2u * conv_dim + idx];
+    conv_state[2u * conv_dim + idx] = x;
+}
