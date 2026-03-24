@@ -36,6 +36,7 @@ static void dbg_vec(const char* label, const float* v, int n) {
 #include "weights.h"
 #include "linear_attn.h"
 #include "full_attn.h"
+#include "expert_cache.h"
 
 #define TOKENIZER_IMPL
 #include "tokenizer.h"
@@ -765,7 +766,8 @@ static void fused_layer_forward(
     LinearAttnState* la_state __attribute__((unused)), // non-NULL for linear attention layers
     int pos,
     int packed_fd,
-    IoRing* ring)
+    IoRing* ring,
+    ExpertCache* ecache)
 {
     double t0 = 0, t1 = 0;
     LayerWeightCache* lc = &layer_cache[layer_idx];
@@ -1145,24 +1147,31 @@ static void fused_layer_forward(
     if (g_timing_enabled) { t1 = now_ms(); g_timing.cpu_routing += t1 - t0; }
 
     // =================================================================
-    // Phase 7: Expert I/O via io_uring
+    // Phase 7: Expert I/O — via DRAM cache + CAR + io_uring fallback
     // =================================================================
     if (g_timing_enabled) t0 = now_ms();
 
     if (packed_fd >= 0) {
-        uint64_t io_offsets[K_EXPERTS];
-        void*    io_dests[K_EXPERTS];
-        size_t   io_sizes[K_EXPERTS];
+        void* expert_dests[K_EXPERTS];
+        for (int k = 0; k < K_EXPERTS; k++)
+            expert_dests[k] = vk_buf_map(bufs->expert_data[k]);
 
-        for (int k = 0; k < K_EXPERTS; k++) {
-            io_offsets[k] = (uint64_t)expert_indices[k] * EXPERT_SIZE;
-            io_dests[k]   = vk_buf_map(bufs->expert_data[k]);
-            io_sizes[k]   = EXPERT_SIZE;
-        }
-
-        int ret = io_ring_read_experts(ring, packed_fd, io_offsets, io_dests, io_sizes, K_EXPERTS);
-        if (ret != 0) {
-            fprintf(stderr, "WARNING: layer %d expert io_ring read failed\n", layer_idx);
+        if (ecache) {
+            expert_cache_route_and_load(ecache, layer_idx, packed_fd,
+                scores_copy, expert_indices, expert_weights,
+                expert_dests, EXPERT_SIZE, ring);
+        } else {
+            // Fallback: direct io_uring (no cache)
+            uint64_t io_offsets[K_EXPERTS];
+            size_t   io_sizes[K_EXPERTS];
+            for (int k = 0; k < K_EXPERTS; k++) {
+                io_offsets[k] = (uint64_t)expert_indices[k] * EXPERT_SIZE;
+                io_sizes[k]   = EXPERT_SIZE;
+            }
+            int ret = io_ring_read_experts(ring, packed_fd, io_offsets, expert_dests, io_sizes, K_EXPERTS);
+            if (ret != 0) {
+                fprintf(stderr, "WARNING: layer %d expert io_ring read failed\n", layer_idx);
+            }
         }
     }
 
@@ -1257,6 +1266,14 @@ int main(int argc, char** argv) {
     float top_p = 0.9f;
     const char* model_dir = ".";  // Directory containing model_weights.bin/json and packed_experts/
 
+    // Expert cache / CAR options
+    float car_threshold = 0.35f;   // CAR threshold (0=always substitute, 1=disabled)
+    int   car_dampen = 1;          // dampening enabled by default
+    int   warmup_tokens = 0;       // force full fidelity for first N tokens
+    const char* freq_profile_path = NULL;   // load frequency profile
+    const char* profile_out_path = NULL;    // save frequency profile
+    int   no_cache = 0;            // disable expert cache entirely
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt = argv[++i];
@@ -1272,9 +1289,26 @@ int main(int argc, char** argv) {
             top_p = atof(argv[++i]);
         } else if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
             model_dir = argv[++i];
+        } else if (strcmp(argv[i], "--car-threshold") == 0 && i + 1 < argc) {
+            car_threshold = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--car-dampen") == 0) {
+            car_dampen = 1;
+        } else if (strcmp(argv[i], "--no-car-dampen") == 0) {
+            car_dampen = 0;
+        } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
+            warmup_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--freq-profile") == 0 && i + 1 < argc) {
+            freq_profile_path = argv[++i];
+        } else if (strcmp(argv[i], "--profile-out") == 0 && i + 1 < argc) {
+            profile_out_path = argv[++i];
+        } else if (strcmp(argv[i], "--no-cache") == 0) {
+            no_cache = 1;
         } else {
             fprintf(stderr, "Usage: %s --prompt \"text\" --tokens N [--timing] "
-                    "[--temperature T] [--top-p P] [--model-dir DIR]\n", argv[0]);
+                    "[--temperature T] [--top-p P] [--model-dir DIR]\n"
+                    "  Expert cache: [--car-threshold F] [--warmup N]\n"
+                    "                [--car-dampen] [--no-car-dampen] [--no-cache]\n"
+                    "  Profiling:    [--freq-profile FILE] [--profile-out FILE]\n", argv[0]);
             return 1;
         }
     }
@@ -1282,6 +1316,10 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[config] prompt=\"%.60s%s\" tokens=%d temp=%.2f top_p=%.2f timing=%d\n",
             prompt, strlen(prompt) > 60 ? "..." : "", max_tokens, temperature, top_p,
             g_timing_enabled);
+    if (!no_cache) {
+        fprintf(stderr, "[config] CAR threshold=%.2f dampen=%d warmup=%d\n",
+                car_threshold, car_dampen, warmup_tokens);
+    }
 
     double t0_total = now_ms();
 
@@ -1344,6 +1382,22 @@ int main(int argc, char** argv) {
         if (layer_fds[i] >= 0) expert_layers_available++;
     }
     fprintf(stderr, "[init] Expert layers: %d/%d available\n", expert_layers_available, NUM_LAYERS);
+
+    // ---- Create expert cache (mmap + mincore for CAR routing) ----
+    ExpertCache* ecache = NULL;
+    if (!no_cache && expert_layers_available > 0) {
+        ecache = expert_cache_create(NUM_LAYERS, EXPERT_SIZE, layer_fds);
+        if (ecache) {
+            expert_cache_set_car(ecache, car_threshold, car_dampen, warmup_tokens);
+            if (freq_profile_path) {
+                if (expert_cache_load_profile(ecache, freq_profile_path) == 0) {
+                    expert_cache_warmup_from_profile(ecache);
+                }
+            }
+        } else {
+            fprintf(stderr, "WARNING: expert cache creation failed, running without cache\n");
+        }
+    }
 
     // ---- Create pipelines ----
     Pipelines pipes;
@@ -1510,7 +1564,7 @@ int main(int argc, char** argv) {
             fused_layer_forward(ctx, wf, &pipes, &buf, layer, hidden,
                                 is_full ? kv_caches[layer] : NULL,
                                 is_full ? NULL : la_states[layer],
-                                pos, layer_fds[layer], ring);
+                                pos, layer_fds[layer], ring, ecache);
         }
         // Wait for last layer's deferred expert compute
         deferred_wait();
@@ -1519,6 +1573,8 @@ int main(int argc, char** argv) {
         // Reset descriptor pool between tokens
         vk_descriptor_pool_reset(ctx);
         pos++;
+
+        if (ecache) expert_cache_new_token(ecache);
 
         if (t == 0) {
             fprintf(stderr, "  [prefill] first token: %.0f ms\n", now_ms() - t_prefill_start);
@@ -1631,7 +1687,7 @@ int main(int argc, char** argv) {
             fused_layer_forward(ctx, wf, &pipes, &buf, layer, hidden,
                                 is_full ? kv_caches[layer] : NULL,
                                 is_full ? NULL : la_states[layer],
-                                pos, layer_fds[layer], ring);
+                                pos, layer_fds[layer], ring, ecache);
         }
         // Wait for last layer's deferred expert compute
         deferred_wait();
@@ -1639,6 +1695,7 @@ int main(int argc, char** argv) {
         memcpy(hidden, vk_buf_map(buf.hidden), HIDDEN_DIM * sizeof(float));
         vk_descriptor_pool_reset(ctx);
         pos++;
+        if (ecache) expert_cache_new_token(ecache);
 
         // Final norm + LM head (merged into one command buffer)
         {
@@ -1689,10 +1746,21 @@ int main(int argc, char** argv) {
     }
     printf("Config:         K=%d experts, %d layers\n", K_EXPERTS, NUM_LAYERS);
 
+    // Expert cache stats and profile save
+    if (ecache) {
+        expert_cache_print_stats(ecache);
+        if (profile_out_path) {
+            expert_cache_save_profile(ecache, profile_out_path);
+        }
+    }
+
     // ---- Cleanup ----
 cleanup:
     free(hidden);
     free(logits);
+
+    // Destroy expert cache before closing layer_fds (cache uses them for backfill)
+    if (ecache) expert_cache_destroy(ecache);
 
     for (int i = 0; i < NUM_LAYERS; i++) {
         if (kv_caches[i]) kv_cache_destroy(kv_caches[i]);

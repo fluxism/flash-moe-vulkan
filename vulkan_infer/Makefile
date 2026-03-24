@@ -6,7 +6,7 @@ LDFLAGS = -ldl -luring -lcblas -lblas -lpthread -lm
 GLSLC = glslc
 
 INFER_TARGET = infer
-INFER_SRC = infer.c vk_compute.c io_ring.c weights.c linear_attn.c full_attn.c deps/volk.c
+INFER_SRC = infer.c vk_compute.c io_ring.c weights.c linear_attn.c full_attn.c expert_cache.c deps/volk.c
 
 # Shader sources and SPIR-V outputs
 SHADER_DIR = shaders
@@ -22,7 +22,7 @@ shaders: $(SHADER_SPVS)
 $(SHADER_DIR)/%.spv: $(SHADER_DIR)/%.comp
 	$(GLSLC) --target-env=vulkan1.3 -O $< -o $@
 
-$(INFER_TARGET): $(INFER_SRC) vk_compute.h io_ring.h
+$(INFER_TARGET): $(INFER_SRC) vk_compute.h io_ring.h expert_cache.h
 	$(CC) $(CFLAGS) $(INFER_SRC) -o $(INFER_TARGET) $(LDFLAGS)
 
 test_vk: test_vk.c vk_compute.c deps/volk.c shaders/test_add.spv
