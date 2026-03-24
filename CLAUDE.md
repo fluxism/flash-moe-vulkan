@@ -80,6 +80,15 @@ ln -s ../model/packed_experts .
 ./infer --prompt "Explain quantum computing" --tokens 100
 ./infer --prompt "Hello" --tokens 20 --timing    # per-layer breakdown
 ./infer --prompt "Hello" --tokens 10 --debug      # intermediate value traces
+
+# Cache-Aware Routing (CAR) — substitute cached experts to reduce SSD reads
+./infer --prompt "Hello" --tokens 50 --car-threshold 0.35
+./infer --prompt "Hello" --tokens 50 --car-threshold 0.35 --no-car-dampen
+./infer --prompt "Hello" --tokens 50 --no-cache   # disable expert cache entirely
+
+# Frequency profiling — save/load expert access patterns for warm starts
+./infer --prompt "Hello" --tokens 100 --profile-out freq.bin
+./infer --prompt "Hello" --tokens 100 --freq-profile freq.bin
 ```
 
 ### Hardware Requirements (Vulkan)
@@ -115,6 +124,8 @@ The key insight: only ~28MB of expert data is needed per layer per token. Instea
 
 5. **Deferred Command Buffers** — Expert compute and MoE combine run deferred, overlapping GPU work with next layer's SSD I/O. Merged 5 submit+waits per layer into 1–2.
 
+6. **Cache-Aware Routing (CAR)** — Uses mmap + mincore() to detect OS page cache residency. When a selected expert is not cached, substitutes the highest-scoring cached alternative (with dampened weights). Background thread issues madvise(WILLNEED) to pre-populate originally-requested experts for future tokens. Frequency profiling enables warm-start cache seeding. Inspired by [fomoe](https://github.com/pmerolla/fomoe).
+
 ## All Results
 
 | Hardware | Backend | tok/s | Quality | Notes |
@@ -135,6 +146,7 @@ vulkan_infer/             # Vulkan/Linux backend (this port)
   weights.h/c             #   weight loading + JSON manifest parser
   linear_attn.h/c         #   CPU GatedDeltaNet via OpenBLAS
   full_attn.h/c           #   CPU full attention with RoPE + KV cache
+  expert_cache.h/c        #   CAR routing + mmap/mincore cache + backfill
   shaders/                #   14 GLSL compute shaders → SPIR-V
     dequant_matvec_4bit.comp    FMA-optimized 4-bit dequant (critical path)
     fused_gate_up_swiglu.comp   Fused expert gate+up+SwiGLU
